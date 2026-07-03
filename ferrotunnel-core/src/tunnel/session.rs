@@ -1,4 +1,4 @@
-use crate::rate_limit::{RateLimiterConfig, SessionRateLimiter};
+use crate::rate_limit::SessionRateLimiter;
 use crate::stream::AnyMultiplexer;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -48,9 +48,8 @@ impl Session {
             last_heartbeat: now,
             capabilities,
             multiplexer,
-            // Enforce per-session limits by default so the limiter is never dead code.
-            // Callers may override via [`Self::with_rate_limiter`].
-            rate_limiter: Some(SessionRateLimiter::new(&RateLimiterConfig::default())),
+            // Per-session limits on by default; FERROTUNNEL_RATE_LIMIT_MBPS overrides the budget (0 = off), and callers may override via [`Self::with_rate_limiter`].
+            rate_limiter: SessionRateLimiter::from_env_default(),
         }
     }
 
