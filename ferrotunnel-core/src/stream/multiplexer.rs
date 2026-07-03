@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::timeout;
 use tracing::warn;
 
 /// Maximum time to wait when sending a frame to the wire channel (`frame_tx`)
@@ -76,14 +75,24 @@ async fn send_prioritized_frame(
     frame_tx: &AsyncSender<PrioritizedFrame>,
     frame: PrioritizedFrame,
 ) -> Result<()> {
-    match timeout(FRAME_SEND_TIMEOUT, frame_tx.send(frame)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()).into()),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out sending frame to wire channel",
-        )
-        .into()),
+    // Cancellation-safe: `timeout(send())` can drop kanal's send future mid-handshake and lose the frame while the send reports success elsewhere; try_send_option keeps the frame in `item` until the channel definitively accepts it.
+    let mut item = Some(frame);
+    let deadline = tokio::time::Instant::now() + FRAME_SEND_TIMEOUT;
+    loop {
+        match frame_tx.try_send_option(&mut item) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out sending frame to wire channel",
+                    )
+                    .into());
+                }
+                tokio::time::sleep(Duration::from_micros(500)).await;
+            }
+            Err(e) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()).into()),
+        }
     }
 }
 
@@ -309,13 +318,23 @@ type SendFuture = Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Sen
 /// into the future itself; a timeout or closed channel resolves to an error.
 fn bounded_send_future(tx: AsyncSender<PrioritizedFrame>, frame: PrioritizedFrame) -> SendFuture {
     Box::pin(async move {
-        match timeout(FRAME_SEND_TIMEOUT, tx.send(frame)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out sending frame to wire channel",
-            )),
+        // Cancellation-safe: see send_prioritized_frame — never park a kanal send future that a timeout may drop mid-handshake.
+        let mut item = Some(frame);
+        let deadline = tokio::time::Instant::now() + FRAME_SEND_TIMEOUT;
+        loop {
+            match tx.try_send_option(&mut item) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out sending frame to wire channel",
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_micros(500)).await;
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())),
+            }
         }
     })
 }
@@ -577,6 +596,7 @@ impl AsyncWrite for VirtualStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn test_stream_id_allocation() {

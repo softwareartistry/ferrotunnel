@@ -17,7 +17,6 @@ use std::io;
 use std::io::IoSlice;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::time::timeout;
 use tokio_util::codec::Encoder;
 use tracing::warn;
 
@@ -77,14 +76,12 @@ pub async fn run_batched_sender<W>(
             let deadline = Duration::from_micros(BATCH_TIMEOUT_MICROS);
             let start = Instant::now();
 
-            while frames.len() < MAX_BATCH_SIZE {
-                let remaining = deadline.saturating_sub(start.elapsed());
-                if remaining.is_zero() {
-                    break;
-                }
-                match timeout(remaining, frame_rx.recv()).await {
-                    Ok(Ok(pf)) => frames.push(pf),
-                    _ => break,
+            // Cancellation-free drain: `timeout(_, recv())` can drop kanal's receive future at the exact instant a sender completes a rendezvous hand-off into it, silently losing the frame (the sender sees success); try_recv never parks, so nothing can be lost.
+            while frames.len() < MAX_BATCH_SIZE && start.elapsed() < deadline {
+                match frame_rx.try_recv() {
+                    Ok(Some(pf)) => frames.push(pf),
+                    Ok(None) => tokio::task::yield_now().await,
+                    Err(_) => break,
                 }
             }
         }
@@ -233,6 +230,7 @@ async fn write_all_vectored<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use tokio::time::timeout;
     use ferrotunnel_protocol::codec::TunnelCodec;
     use ferrotunnel_protocol::frame::StreamPriority;
     use kanal::bounded_async;
