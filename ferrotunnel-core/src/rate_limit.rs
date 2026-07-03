@@ -105,6 +105,14 @@ impl SessionRateLimiter {
     pub async fn wait_for_data(&self, _bytes: usize) {
         self.bytes_limiter.until_ready().await;
     }
+
+    /// Wait until `bytes` tokens are available, then consume them (true backpressure; oversize payloads that can never conform pass through rather than stall forever).
+    pub async fn throttle_data(&self, bytes: usize) {
+        let Some(n) = NonZeroU32::new(u32::try_from(bytes).unwrap_or(u32::MAX)) else {
+            return;
+        };
+        let _ = self.bytes_limiter.until_n_ready(n).await;
+    }
 }
 
 impl std::fmt::Debug for SessionRateLimiter {

@@ -406,9 +406,9 @@ impl TunnelServer {
                         warn!(
                             session_id = %session_id,
                             bytes = data.len(),
-                            "Data rate limit exceeded; dropping data frame"
+                            "Data rate limit exceeded; throttling session (dropping would corrupt the tunneled byte stream)"
                         );
-                        continue;
+                        limiter.throttle_data(data.len()).await;
                     }
                     _ => {}
                 }
@@ -1003,8 +1003,7 @@ mod tests {
         .with_rate_limiter(SessionRateLimiter::new(&tight));
         sessions.add(session).unwrap();
 
-        // Open stream 1, send 8 bytes (the whole 8-byte budget), then 8 more
-        // bytes (over budget -> must be dropped by the Frame::Data limiter arm).
+        // Open stream 1, send 8 bytes (the whole budget), then 8 more (over budget -> the limiter arm must throttle, never drop).
         let mut client = Framed::new(client_side, TunnelCodec::new());
         client
             .send(Frame::OpenStream(Box::new(OpenStreamFrame {
@@ -1036,20 +1035,25 @@ mod tests {
         // after `process_messages` returns; otherwise a dropped (rate-limited) frame
         // would be indistinguishable from channel-close EOF.
         let _keepalive = multiplexer.clone();
+        let started = Instant::now();
         TunnelServer::process_messages(framed_read, session_id, sessions, multiplexer)
             .await
             .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "over-budget data frame must be throttled (delayed), got {:?}",
+            started.elapsed()
+        );
 
-        // The opened stream receives only the first (in-budget) data frame; the
-        // second is dropped, so a follow-up read has nothing more to deliver.
+        // Both frames must arrive intact and in order: dropping the over-budget frame would corrupt the tunneled byte stream.
         let mut stream = new_stream_rx.recv().await.unwrap();
         let mut buf = vec![0u8; 64];
         let first = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..first], b"AAAAAAAA");
-        let second = timeout(Duration::from_millis(300), stream.read(&mut buf)).await;
-        assert!(
-            second.is_err(),
-            "over-budget data frame must be dropped by the rate limiter"
-        );
+        let second = timeout(Duration::from_millis(300), stream.read(&mut buf))
+            .await
+            .expect("over-budget data frame must be delivered after throttling, not dropped")
+            .unwrap();
+        assert_eq!(&buf[..second], b"BBBBBBBB");
     }
 }
