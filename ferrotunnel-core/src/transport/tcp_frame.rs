@@ -12,7 +12,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::io::AsyncRead;
-use tokio::time::timeout;
 use tokio_util::codec::FramedRead;
 
 /// Maximum time to wait when pushing a frame to the batched-sender channel
@@ -36,14 +35,24 @@ impl FrameSender for TcpFrameSender {
     fn send_frame(&self, frame: Frame) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
         let tx = self.tx.clone();
         Box::pin(async move {
-            // Trait API has no priority; use Normal when sending via trait.
-            // Fail fast on a full/closed channel instead of blocking forever (#136).
-            match timeout(FRAME_SEND_TIMEOUT, tx.send((StreamPriority::Normal, frame))).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(ferrotunnel_common::TunnelError::Protocol(e.to_string())),
-                Err(_) => Err(ferrotunnel_common::TunnelError::Protocol(
-                    "timed out sending frame to wire channel".into(),
-                )),
+            // Cancellation-safe fail-fast (#136): timeout(send()) can drop kanal's send future mid-handoff and lose the frame, so retry try_send_option (priority Normal — trait API has none) until accepted or the deadline passes.
+            let mut item = Some((StreamPriority::Normal, frame));
+            let deadline = tokio::time::Instant::now() + FRAME_SEND_TIMEOUT;
+            loop {
+                match tx.try_send_option(&mut item) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(ferrotunnel_common::TunnelError::Protocol(
+                                "timed out sending frame to wire channel".into(),
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_micros(500)).await;
+                    }
+                    Err(e) => {
+                        return Err(ferrotunnel_common::TunnelError::Protocol(e.to_string()))
+                    }
+                }
             }
         })
     }
