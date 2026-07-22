@@ -59,7 +59,7 @@ impl Default for Http3IngressConfig {
             max_request_body_size: 100 * 1024 * 1024,
             max_response_size: 100 * 1024 * 1024,
             handshake_timeout: Duration::from_secs(10),
-            response_timeout: Duration::from_mins(1),
+            response_timeout: Duration::from_mins(60),
             alt_svc_max_age: 86_400,
             idle_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(10),
@@ -89,6 +89,12 @@ impl Http3IngressConfig {
     #[must_use]
     pub fn client_auth(mut self, enabled: bool) -> Self {
         self.client_auth = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn response_timeout(mut self, timeout: Duration) -> Self {
+        self.response_timeout = timeout;
         self
     }
 

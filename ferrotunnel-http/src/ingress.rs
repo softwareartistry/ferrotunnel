@@ -32,7 +32,10 @@ pub struct IngressConfig {
     pub max_response_size: usize,
     /// Timeout for upstream handshake (default: 10s)
     pub handshake_timeout: Duration,
-    /// Timeout for upstream response (default: 60s)
+    /// Timeout for upstream response (default: 1h). Governs both time-to-first-
+    /// response-head and the per-frame stall guard on the streamed body, so it
+    /// must exceed the slowest legitimate upstream (e.g. a long-running gRPC
+    /// query streaming Arrow batches). Override via FERROTUNNEL_HTTP_RESPONSE_TIMEOUT.
     pub response_timeout: Duration,
     /// Optional Alt-Svc header value to advertise HTTP/3 ingress.
     pub alt_svc_header: Option<HeaderValue>,
@@ -45,7 +48,7 @@ impl Default for IngressConfig {
             max_request_body_size: 100 * 1024 * 1024, // 100MB
             max_response_size: 100 * 1024 * 1024,     // 100MB
             handshake_timeout: Duration::from_secs(10),
-            response_timeout: Duration::from_mins(1),
+            response_timeout: Duration::from_mins(60),
             alt_svc_header: None,
         }
     }
