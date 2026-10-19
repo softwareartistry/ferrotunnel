@@ -385,7 +385,15 @@ impl TunnelServer {
                     .await?;
 
                 // Enter message loop
-                Self::process_messages(stream, session_id, sessions, multiplexer).await?;
+                // Every exit, not just a clean EOF: a session whose read loop has
+                // ended can't serve requests, so stop routing to it and fail its streams.
+                let streams = multiplexer.clone();
+                let store = sessions.clone();
+                let result =
+                    Self::process_messages(stream, session_id, sessions, multiplexer).await;
+                store.remove(&session_id);
+                streams.close_all_streams();
+                result?;
             }
             _ => {
                 return Err(TunnelError::Protocol("Expected handshake".into()));
