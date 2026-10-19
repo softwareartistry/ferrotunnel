@@ -15,7 +15,7 @@ use ferrotunnel_protocol::frame::{Frame, OpenStreamFrame, Protocol, StreamPriori
 use kanal::{bounded_async, AsyncReceiver, AsyncSender, ReceiveError};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -60,6 +60,8 @@ pub struct Multiplexer {
     /// Stream priority for send scheduling (cleaned on CloseStream).
     stream_priorities: Arc<DashMap<u32, StreamPriority>>,
     last_sender: Arc<Mutex<Option<CachedSender>>>,
+    /// Set by `close_all_streams`; a stream opened after it fails instead of hanging.
+    closed: Arc<AtomicBool>,
     next_stream_id: Arc<AtomicU32>,
     frame_tx: AsyncSender<PrioritizedFrame>,
     new_stream_tx: AsyncSender<VirtualStream>,
@@ -108,6 +110,7 @@ impl Multiplexer {
                 streams: Arc::new(DashMap::new()),
                 stream_priorities: Arc::new(DashMap::new()),
                 last_sender: Arc::new(Mutex::new(None)),
+                closed: Arc::new(AtomicBool::new(false)),
                 next_stream_id: Arc::new(AtomicU32::new(initial_stream_id)),
                 frame_tx,
                 new_stream_tx,
@@ -232,6 +235,25 @@ impl Multiplexer {
         Ok(())
     }
 
+    /// Ends every stream on this multiplexer: the session carrying them is gone.
+    /// Each stream's reader gets an error instead of waiting on senders that
+    /// ingress handlers keep alive through their own multiplexer clones. An error,
+    /// not EOF, so a cut close-delimited response can't pass as complete.
+    pub fn close_all_streams(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = self.last_sender.lock() {
+            *guard = None;
+        }
+        for entry in self.streams.iter() {
+            // A full channel just drops: its reader sees EOF once the queue drains.
+            let _ = entry
+                .value()
+                .try_send(Err(TunnelError::Protocol("tunnel session closed".into())));
+        }
+        self.streams.clear();
+        self.stream_priorities.clear();
+    }
+
     fn cached_sender(&self, stream_id: u32) -> Option<AsyncSender<Result<Frame>>> {
         let guard = self.last_sender.try_lock().ok()?;
         let (cached_id, tx) = guard.as_ref()?;
@@ -265,6 +287,12 @@ impl Multiplexer {
 
         let (tx, rx) = bounded_async(STREAM_CHANNEL_CAPACITY);
         self.streams.insert(stream_id, tx);
+        // Checked after the insert: a close racing this either sees the entry or
+        // has already set the flag.
+        if self.closed.load(Ordering::SeqCst) {
+            self.streams.remove(&stream_id);
+            return Err(TunnelError::Protocol("tunnel session closed".into()));
+        }
 
         self.stream_priorities.insert(stream_id, priority);
         send_prioritized_frame(
@@ -745,5 +773,35 @@ mod tests {
 
         assert_eq!(first, STREAM_B, "fast stream B must complete first");
         assert_eq!(second, STREAM_A, "slow stream A must complete last");
+    }
+
+    #[tokio::test]
+    async fn close_all_streams_fails_pending_and_new_streams() {
+        use tokio::io::AsyncReadExt;
+
+        let (frame_tx, _frame_rx) = bounded_async::<PrioritizedFrame>(64);
+        let (mux, new_stream_rx) = Multiplexer::new(frame_tx, false);
+        // An ingress handler's clone: keeps the streams map alive after the session ends.
+        let held = mux.clone();
+        mux.process_frame(Frame::OpenStream(Box::new(OpenStreamFrame {
+            stream_id: 2,
+            protocol: Protocol::GRPC,
+            headers: vec![],
+            body_hint: None,
+            priority: StreamPriority::default(),
+        })))
+        .await
+        .expect("process_frame queues the new stream");
+        let mut stream = new_stream_rx.recv().await.expect("stream queued");
+
+        mux.close_all_streams();
+
+        let mut buf = [0u8; 16];
+        let read = timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("read must not wait on a dead session");
+        assert!(read.is_err(), "a cut stream must error, not look complete");
+
+        assert!(held.open_stream(Protocol::GRPC).await.is_err());
     }
 }
