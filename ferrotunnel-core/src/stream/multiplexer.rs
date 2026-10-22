@@ -10,7 +10,7 @@ use super::pool::ObjectPool;
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use ferrotunnel_common::Result;
+use ferrotunnel_common::{Result, TunnelError};
 use ferrotunnel_protocol::frame::{Frame, OpenStreamFrame, Protocol, StreamPriority};
 use kanal::{bounded_async, AsyncReceiver, AsyncSender, ReceiveError};
 use std::io;
@@ -20,17 +20,20 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::timeout;
 use tracing::warn;
 
-/// Maximum time to wait when sending a frame to the wire channel (`frame_tx`)
+/// Maximum time to keep retrying a send to the wire channel (`frame_tx`)
 /// before treating the peer as unreachable and failing the send.
 ///
 /// The `frame_tx` channel is drained by the batched sender. If that task exits
-/// (teardown) or stalls (network partition with a full channel), a plain
-/// `send().await` would block forever, preventing the read loop from observing
-/// EOF and hanging the session. Bounding every send with this deadline ensures
-/// teardown completes promptly. See issue #136.
+/// (teardown) or stalls (network partition with a full channel), an unbounded
+/// wait would prevent the read loop from observing EOF and hang the session.
+/// Sends retry `try_send_option` with a short backoff — polling only while the
+/// channel is full — and fail once this deadline passes, so teardown completes
+/// promptly and a delivered frame is never reported as timed out. The trade
+/// for that accuracy: blocked senders poll on 1–10 ms timers instead of
+/// parking in the channel's waitlist, so wakeup order among them is not
+/// preserved under sustained backpressure. See #136.
 const FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pool for reusing read buffers in `VirtualStream`
@@ -65,6 +68,7 @@ pub struct Multiplexer {
     frame_tx: AsyncSender<PrioritizedFrame>,
     new_stream_tx: AsyncSender<VirtualStream>,
     buffer_pool: ReadBufferPool,
+    rate_limiter: Option<crate::rate_limit::SessionRateLimiter>,
 }
 
 /// Send a prioritized frame to the wire channel with a bounded deadline.
@@ -76,14 +80,26 @@ async fn send_prioritized_frame(
     frame_tx: &AsyncSender<PrioritizedFrame>,
     frame: PrioritizedFrame,
 ) -> Result<()> {
-    match timeout(FRAME_SEND_TIMEOUT, frame_tx.send(frame)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()).into()),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out sending frame to wire channel",
-        )
-        .into()),
+    let mut item = Some(frame);
+    let deadline = tokio::time::Instant::now() + FRAME_SEND_TIMEOUT;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match frame_tx.try_send_option(&mut item) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out sending frame to wire channel",
+                    )
+                    .into());
+                }
+                tokio::time::sleep(backoff.min(deadline.duration_since(now))).await;
+                backoff = (backoff * 2).min(Duration::from_millis(10));
+            }
+            Err(e) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()).into()),
+        }
     }
 }
 
@@ -103,9 +119,26 @@ impl Multiplexer {
                 frame_tx,
                 new_stream_tx,
                 buffer_pool: ReadBufferPool::with_default_capacity(),
+                rate_limiter: None,
             },
             new_stream_rx,
         )
+    }
+
+    /// Apply `limiter` to the stream-open rate for streams opened through
+    /// [`AnyMultiplexer`](crate::stream::AnyMultiplexer).
+    ///
+    /// Only stream opens are metered here. Byte rates on this transport are
+    /// already applied by `TunnelServer::process_messages` as frames arrive.
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::SessionRateLimiter) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// The session rate limiter applied to streams from this multiplexer, if any.
+    pub fn rate_limiter(&self) -> Option<&crate::rate_limit::SessionRateLimiter> {
+        self.rate_limiter.as_ref()
     }
 
     /// Priority for a frame when sending (used by batched sender order).
@@ -130,10 +163,16 @@ impl Multiplexer {
         &self.buffer_pool
     }
 
-    /// Allocate a new stream ID atomically (lock-free)
+    /// Allocate a new stream ID atomically (lock-free).
+    ///
+    /// IDs advance by two to preserve client/server parity. Returns an error
+    /// rather than wrapping past `u32::MAX`, so an exhausted ID space can never
+    /// silently alias a live stream.
     #[inline]
-    fn allocate_stream_id(&self) -> u32 {
-        self.next_stream_id.fetch_add(2, Ordering::Relaxed)
+    fn allocate_stream_id(&self) -> Result<u32> {
+        self.next_stream_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(2))
+            .map_err(|_| TunnelError::Protocol("stream ID space exhausted".into()))
     }
 
     /// Send a frame directly to the wire (priority derived from frame type and stream).
@@ -246,7 +285,7 @@ impl Multiplexer {
         protocol: Protocol,
         priority: StreamPriority,
     ) -> Result<VirtualStream> {
-        let stream_id = self.allocate_stream_id();
+        let stream_id = self.allocate_stream_id()?;
 
         let (tx, rx) = bounded_async(STREAM_CHANNEL_CAPACITY);
         self.streams.insert(stream_id, tx);
@@ -303,13 +342,25 @@ type SendFuture = Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Sen
 /// into the future itself; a timeout or closed channel resolves to an error.
 fn bounded_send_future(tx: AsyncSender<PrioritizedFrame>, frame: PrioritizedFrame) -> SendFuture {
     Box::pin(async move {
-        match timeout(FRAME_SEND_TIMEOUT, tx.send(frame)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out sending frame to wire channel",
-            )),
+        let mut item = Some(frame);
+        let deadline = tokio::time::Instant::now() + FRAME_SEND_TIMEOUT;
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            match tx.try_send_option(&mut item) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out sending frame to wire channel",
+                        ));
+                    }
+                    tokio::time::sleep(backoff.min(deadline.duration_since(now))).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(10));
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())),
+            }
         }
     })
 }
@@ -451,11 +502,7 @@ impl AsyncRead for VirtualStream {
             Poll::Ready(result) => {
                 self.pending_recv = None;
                 match result {
-                    Ok(Ok(Frame::Data {
-                        data: bytes,
-                        end_of_stream: _,
-                        ..
-                    })) => {
+                    Ok(Ok(Frame::Data { data: bytes, .. })) => {
                         let len = std::cmp::min(buf.remaining(), bytes.len());
                         buf.put_slice(&bytes[..len]);
                         if len < bytes.len() {
@@ -575,6 +622,7 @@ impl AsyncWrite for VirtualStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn test_stream_id_allocation() {

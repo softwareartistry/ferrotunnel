@@ -7,8 +7,8 @@
 //!
 //! # async fn example() -> ferrotunnel::Result<()> {
 //! let mut server = Server::builder()
-//!     .bind("0.0.0.0:7835".parse().unwrap())
-//!     .http_bind("0.0.0.0:8080".parse().unwrap())
+//!     .bind("0.0.0.0:7835".parse().expect("valid tunnel bind"))
+//!     .http_bind("0.0.0.0:8080".parse().expect("valid HTTP bind"))
 //!     .token("my-secret-token")
 //!     .build()?;
 //!
@@ -20,18 +20,19 @@
 //! ```
 
 use crate::config::ServerConfig;
-use ferrotunnel_common::config::TlsConfig;
+use ferrotunnel_common::config::{LimitsConfig, RateLimitConfig, TlsConfig};
 use ferrotunnel_common::{Result, TunnelError};
+use ferrotunnel_core::resource_limits::ServerResourceLimits;
 use ferrotunnel_core::transport::{tls::TlsTransportConfig, TransportConfig};
 use ferrotunnel_core::TunnelServer;
-use ferrotunnel_http::HttpIngress;
 #[cfg(feature = "http3")]
 use ferrotunnel_http::{Http3Ingress, Http3IngressConfig};
+use ferrotunnel_http::{HttpIngress, IngressConfig};
 use ferrotunnel_plugin::PluginRegistry;
 use std::net::SocketAddr;
-#[cfg(feature = "http3")]
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -52,6 +53,7 @@ pub struct Server {
 pub struct ServerBuilder {
     config: ServerConfig,
     transport_config: Option<TransportConfig>,
+    tls_validation_error: Option<TunnelError>,
 }
 
 impl Server {
@@ -63,11 +65,12 @@ impl Server {
     /// use ferrotunnel::Server;
     ///
     /// let server = Server::builder()
-    ///     .bind("0.0.0.0:7835".parse().unwrap())
+    ///     .bind("0.0.0.0:7835".parse().expect("valid tunnel bind"))
     ///     .token("secret")
     ///     .build()
-    ///     .unwrap();
+    ///     .expect("valid server configuration");
     /// ```
+    #[must_use]
     pub fn builder() -> ServerBuilder {
         ServerBuilder::default()
     }
@@ -117,8 +120,17 @@ impl Server {
 
         #[cfg(feature = "quic")]
         let tunnel_transport = transport_config.clone();
-        let tunnel_server =
-            TunnelServer::new(config.bind_addr, config.token).with_transport(transport_config);
+        let tunnel_limits = config.limits.clone();
+        let resource_limits = ServerResourceLimits::new(
+            tunnel_limits.max_sessions,
+            tunnel_limits.max_streams_per_session,
+            tunnel_limits.max_inflight_frames,
+        );
+        let tunnel_server = TunnelServer::new(config.bind_addr, config.token)
+            .with_transport(transport_config)
+            .with_limits(tunnel_limits)
+            .with_rate_limits(config.rate_limits.clone())
+            .with_resource_limits(resource_limits);
 
         // Initialize plugins
         let mut registry = PluginRegistry::new();
@@ -142,7 +154,16 @@ impl Server {
                 .ok()
         });
 
-        let ingress = HttpIngress::new(config.http_bind_addr, sessions.clone(), registry.clone());
+        let ingress_config = IngressConfig {
+            response_timeout: config.http_response_timeout,
+            ..Default::default()
+        };
+        let ingress = HttpIngress::with_config(
+            config.http_bind_addr,
+            sessions.clone(),
+            registry.clone(),
+            ingress_config,
+        );
         // Shadow (rather than `mut`) so the binding stays immutable when the
         // `http3` feature is disabled and `alt_svc_header` does not exist.
         #[cfg(feature = "http3")]
@@ -179,7 +200,8 @@ impl Server {
             let http3_config = Http3IngressConfig::with_certs(
                 cert_path.to_string_lossy().to_string(),
                 key_path.to_string_lossy().to_string(),
-            );
+            )
+            .response_timeout(config.http_response_timeout);
             let http3_ingress =
                 Http3Ingress::new(http3_bind_addr, sessions, registry, http3_config);
             let http3_shutdown_rx = shutdown_rx.clone();
@@ -348,9 +370,51 @@ impl ServerBuilder {
     /// When enabled, the server will use TLS for all connections.
     #[must_use]
     pub fn tls(mut self, config: &TlsConfig) -> Self {
-        if let Some(tls) = TlsTransportConfig::from_common(config) {
-            self.transport_config = Some(TransportConfig::Tls(tls));
+        match validate_server_tls_config(config) {
+            Ok(()) => {
+                self.tls_validation_error = None;
+                if let Some(tls) = TlsTransportConfig::from_common(config) {
+                    self.transport_config = Some(TransportConfig::Tls(tls));
+                }
+            }
+            Err(error) => {
+                self.tls_validation_error = Some(error);
+                self.transport_config = None;
+            }
         }
+        self
+    }
+
+    /// Configure resource limits (frame size, session, and stream bounds).
+    ///
+    /// Defaults to [`LimitsConfig::default`]. A `max_frame_bytes` of `0` or a
+    /// value larger than `u32::MAX` is rejected by [`ServerBuilder::build`].
+    #[must_use]
+    pub fn limits(mut self, limits: &LimitsConfig) -> Self {
+        self.config.limits = limits.clone();
+        self
+    }
+
+    /// Configure per-session rate limits (stream-open and byte rates).
+    ///
+    /// Defaults to [`RateLimitConfig::default`]. Every value must be non-zero,
+    /// and `bytes_per_sec` must fit in a `u32`, which is what the limiter
+    /// counts in.
+    #[must_use]
+    pub fn rate_limits(mut self, limits: &RateLimitConfig) -> Self {
+        self.config.rate_limits = limits.clone();
+        self
+    }
+
+    /// Configure the upstream response timeout for the HTTP and HTTP/3 ingress.
+    ///
+    /// Bounds both time-to-first-response-head and the per-frame stall guard on
+    /// the streamed body, so it must exceed the slowest legitimate upstream.
+    /// Defaults to 60 seconds. A zero duration is rejected by
+    /// [`ServerBuilder::build`].
+    #[must_use]
+    pub fn http_response_timeout(mut self, timeout: Duration) -> Self {
+        self.config.http_response_timeout = timeout;
         self
     }
 
@@ -364,6 +428,7 @@ impl ServerBuilder {
         if let Some(quic) =
             ferrotunnel_core::transport::quic::QuicTransportConfig::from_common(config)
         {
+            self.tls_validation_error = None;
             self.transport_config = Some(TransportConfig::Quic(quic));
         }
         self
@@ -373,10 +438,16 @@ impl ServerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if required configuration is missing:
+    /// Returns an error if required configuration is missing or invalid:
     /// - `token` must be set
+    /// - every rate-limit value must be non-zero, with `bytes_per_sec` no
+    ///   greater than `u32::MAX`
+    /// - `http_response_timeout` must be greater than zero
     pub fn build(self) -> Result<Server> {
         self.config.validate()?;
+        if let Some(error) = self.tls_validation_error {
+            return Err(error);
+        }
         Ok(Server {
             config: self.config,
             transport_config: self.transport_config.unwrap_or_default(),
@@ -384,6 +455,34 @@ impl ServerBuilder {
             task: None,
         })
     }
+}
+
+fn validate_server_tls_config(config: &TlsConfig) -> Result<()> {
+    if !config.enabled {
+        return Err(TunnelError::Config(
+            "TLS config is disabled; omit ServerBuilder::tls() or enable TLS".into(),
+        ));
+    }
+
+    if missing_path(config.cert_path.as_ref()) {
+        return Err(TunnelError::Config("server TLS requires cert_path".into()));
+    }
+
+    if missing_path(config.key_path.as_ref()) {
+        return Err(TunnelError::Config("server TLS requires key_path".into()));
+    }
+
+    if config.client_auth && missing_path(config.ca_cert_path.as_ref()) {
+        return Err(TunnelError::Config(
+            "server TLS client_auth requires ca_cert_path".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn missing_path(path: Option<&PathBuf>) -> bool {
+    path.is_none_or(|path| path.as_os_str().is_empty())
 }
 
 #[cfg(test)]
@@ -406,6 +505,10 @@ mod tests {
             .bind("0.0.0.0:9000".parse().unwrap())
             .http_bind("0.0.0.0:9001".parse().unwrap())
             .token("my-token")
+            .limits(&LimitsConfig {
+                max_frame_bytes: 4096,
+                ..Default::default()
+            })
             .build()
             .expect("should build successfully");
 
@@ -415,6 +518,48 @@ mod tests {
             "0.0.0.0:9001".parse().unwrap()
         );
         assert_eq!(server.config().token, "my-token");
+        assert_eq!(server.config().limits.max_frame_bytes, 4096);
+    }
+
+    #[test]
+    fn test_server_builder_http_response_timeout_defaults_to_sixty_seconds() {
+        let server = Server::builder()
+            .token("secret")
+            .build()
+            .expect("should build successfully");
+
+        assert_eq!(
+            server.config().http_response_timeout(),
+            Duration::from_mins(1)
+        );
+    }
+
+    #[test]
+    fn test_server_builder_http_response_timeout_override() {
+        let server = Server::builder()
+            .token("secret")
+            .http_response_timeout(Duration::from_mins(10))
+            .build()
+            .expect("should build successfully");
+
+        assert_eq!(
+            server.config().http_response_timeout(),
+            Duration::from_mins(10)
+        );
+    }
+
+    #[test]
+    fn test_server_builder_zero_http_response_timeout_is_rejected() {
+        let result = Server::builder()
+            .token("secret")
+            .http_response_timeout(Duration::ZERO)
+            .build();
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("http_response_timeout must be greater than zero"));
     }
 
     #[test]
@@ -424,6 +569,52 @@ mod tests {
             .build();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("token"));
+    }
+
+    #[test]
+    fn test_server_builder_rejects_invalid_rate_limits() {
+        let cases = [
+            (
+                "streams_per_sec",
+                RateLimitConfig {
+                    streams_per_sec: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "bytes_per_sec",
+                RateLimitConfig {
+                    bytes_per_sec: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "burst_factor",
+                RateLimitConfig {
+                    burst_factor: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "bytes_per_sec",
+                RateLimitConfig {
+                    bytes_per_sec: u64::from(u32::MAX) + 1,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (field, rate_limits) in cases {
+            let err = Server::builder()
+                .token("secret")
+                .rate_limits(&rate_limits)
+                .build()
+                .expect_err("rate-limit values outside the representable range must be rejected");
+            assert!(
+                err.to_string().contains(field),
+                "error should identify {field}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -481,13 +672,70 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
+        let result = Server::builder().token("secret").tls(&tls).build();
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("TLS config is disabled"));
+    }
+
+    #[test]
+    fn test_server_builder_tls_missing_cert() {
+        let tls = TlsConfig {
+            enabled: true,
+            key_path: Some(PathBuf::from("server.key")),
+            ..Default::default()
+        };
+        let result = Server::builder().token("secret").tls(&tls).build();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cert_path"));
+    }
+
+    #[test]
+    fn test_server_builder_tls_missing_key() {
+        let tls = TlsConfig {
+            enabled: true,
+            cert_path: Some(PathBuf::from("server.crt")),
+            ..Default::default()
+        };
+        let result = Server::builder().token("secret").tls(&tls).build();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("key_path"));
+    }
+
+    #[test]
+    fn test_server_builder_tls_client_auth_missing_ca() {
+        let tls = TlsConfig {
+            enabled: true,
+            cert_path: Some(PathBuf::from("server.crt")),
+            key_path: Some(PathBuf::from("server.key")),
+            client_auth: true,
+            ..Default::default()
+        };
+        let result = Server::builder().token("secret").tls(&tls).build();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ca_cert_path"));
+    }
+
+    #[test]
+    fn test_server_builder_tls_with_cert_and_key() {
+        let tls = TlsConfig {
+            enabled: true,
+            cert_path: Some(PathBuf::from("server.crt")),
+            key_path: Some(PathBuf::from("server.key")),
+            ..Default::default()
+        };
         let server = Server::builder()
             .token("secret")
             .tls(&tls)
             .build()
-            .expect("should build");
+            .expect("server-auth TLS should accept certificate and key paths");
 
-        // Server should work with TLS disabled
         assert!(!server.config().token.is_empty());
     }
 }

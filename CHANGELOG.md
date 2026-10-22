@@ -7,6 +7,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-08-17
+
+Reliability release covering per-session rate limiting, frame delivery under
+cancellation, and ingress timeout configuration.
+
+### Added
+
+- Expose the ingress upstream response timeout as `--http-response-timeout`
+  (`FERROTUNNEL_HTTP_RESPONSE_TIMEOUT`), so deployments of the shipped binary can
+  serve upstreams that legitimately take longer than the 60s default. The timeout
+  bounds both the response head and stalls between streamed body frames
+  ([#172](https://github.com/ferro-labs/ferrotunnel/issues/172),
+  [`9202301`](https://github.com/ferro-labs/ferrotunnel/commit/92023013d7f78299b8b99b3dda1529d5e3ff2c37)).
+- Configure the same timeout from the library through
+  `ServerBuilder::http_response_timeout`, and from `Http3IngressConfig` through a
+  matching builder method. Both ingress construction paths now read it, where they
+  previously used a hardcoded 60s
+  ([#172](https://github.com/ferro-labs/ferrotunnel/issues/172),
+  [`9202301`](https://github.com/ferro-labs/ferrotunnel/commit/92023013d7f78299b8b99b3dda1529d5e3ff2c37)).
+- Apply per-session rate limits configured through `Server::builder()`. The
+  `rate_limits` setting was previously accepted and never reached the tunnel
+  server ([#167](https://github.com/ferro-labs/ferrotunnel/issues/167),
+  [`e2e57de`](https://github.com/ferro-labs/ferrotunnel/commit/e2e57dee55dbc0dd53e82db3bfb0487f2f3a69f4)).
+
+### Fixed
+
+- Throttle over-budget sessions instead of dropping their data. Frames exceeding
+  the byte-rate quota are now delayed and delivered, waiting for quota in bounded
+  chunks with the session heartbeat refreshed between them, so a slow session is
+  never evicted as stale
+  ([#167](https://github.com/ferro-labs/ferrotunnel/issues/167),
+  [`e2e57de`](https://github.com/ferro-labs/ferrotunnel/commit/e2e57dee55dbc0dd53e82db3bfb0487f2f3a69f4)).
+- Stop losing frames when a send or receive is cancelled by a timeout, which
+  could corrupt a stream mid-transfer
+  ([#168](https://github.com/ferro-labs/ferrotunnel/issues/168),
+  [`d852b28`](https://github.com/ferro-labs/ferrotunnel/commit/d852b280a1fba7f56a6c7e7698cfd01930814a7b)).
+- Reject zero-valued rate limits at `build()` instead of silently treating them
+  as `1`, the most restrictive setting available, for a value that reads as
+  disabled ([#171](https://github.com/ferro-labs/ferrotunnel/issues/171),
+  [`d59f14f`](https://github.com/ferro-labs/ferrotunnel/commit/d59f14fe6d7f0d656c90bb6f5876843903c0f4fc)).
+- Reject a `bytes_per_sec` above `u32::MAX` rather than clamping it to roughly
+  4.29 GB/s. The limiter counts in `u32` cells, so an out-of-range rate now fails
+  at startup instead of throttling sessions below the configured value. Both
+  `ServerBuilder::build` and `TunnelServer::run` validate, closing the path that
+  bypassed validation entirely
+  ([#176](https://github.com/ferro-labs/ferrotunnel/issues/176)).
+- Enforce per-session rate limits on the QUIC data path. QUIC sessions were
+  given a rate limiter that nothing consulted: unlike TCP, QUIC maps each stream
+  to its own connection-level stream, so its traffic never reaches the frame
+  loop where the byte budget is applied. QUIC streams now carry that budget, and
+  over-budget data is delayed rather than dropped.
+- Apply `rate_limits.streams_per_sec` to the streams the ingress opens, on both
+  transports. The frame loop only ever saw `OpenStream` frames sent by the
+  tunnel client, and the ingress opens its streams in the other direction, so
+  the setting had no effect on request-driven traffic.
+
+  **Operators should check this value before upgrading.** It defaults to 100
+  streams per second with a burst factor of 2, and the HTTP ingress opens one
+  stream per request, so a session sustaining more than roughly 100 requests per
+  second will now be limited where it previously was not. Raise
+  `streams_per_sec` to suit the workload.
+- Complete the `multiplexer_round_trip` benchmark group, which could not finish
+  and left `cargo bench --bench full_stack` hanging
+  ([#174](https://github.com/ferro-labs/ferrotunnel/issues/174)).
+
+### Changed
+
+- Name the library setting `ServerBuilder::http_response_timeout` to match the
+  `--http-response-timeout` flag and reflect that it applies to the HTTP and
+  HTTP/3 ingress rather than the tunnel control plane
+  ([#177](https://github.com/ferro-labs/ferrotunnel/issues/177)).
+- Update workspace and internal dependency versions to 1.5.2.
+
+## [1.5.1] - 2026-07-10
+
+Maintenance release restoring reproducible dependency and release gates and aligning public documentation with the 1.5.x runtime.
+
+### Security
+
+- Update `crossbeam-epoch` to 0.9.20 to resolve RUSTSEC-2026-0204.
+- Update `anyhow` to 1.0.103 and `rand` to 0.9.3 to clear the remaining RustSec unsoundness notices.
+- Track `Cargo.lock` and build, test, and publish with `--locked` so the committed lockfile is the audited dependency set.
+- Run all-feature RustSec advisory, license, source, and ban policy checks in the required CI compliance gate.
+
+### Changed
+
+- Require the Rust 1.91 test job in the aggregate CI gate while retaining beta as an allowed signal.
+- Build and verify publish archives for all eight published crates before release.
+- Run dependency security checks before the production publish script uploads crates, and wait for each crate to appear on crates.io before publishing its dependents.
+- Preserve the underlying error chain when server plugin initialization fails, instead of flattening it to a single message.
+- Publish release assets as full GitHub releases rather than pre-releases. Releases are still created as drafts.
+- Correct roadmap, security, plugin, soak, installer, workflow, and QUIC 0-RTT documentation.
+- Update workspace and internal dependency versions to 1.5.1.
+
+## [1.5.0] - 2026-07-05
+
+Public-API and audit hardening release closing the v1.5.0 milestone and part of
+the v1.5.x audit backlog.
+
+### ⚠ Breaking changes
+
+- Configuration types are now encapsulated. `ClientConfig`, `ServerConfig`, and
+  `TunnelInfo` fields are private with public getters: construct them through
+  `Client::builder()` / `Server::builder()` and read them back with the
+  accessors (for example `config.token()`, `info.session_id()`) instead of
+  field access. This prevents mutation after `build()` and keeps the
+  authentication token out of `Debug` output ([#140](https://github.com/ferro-labs/ferrotunnel/issues/140)).
+
+### Security
+
+- Redact the authentication token in the `Debug` output of `ClientConfig` and
+  `ServerConfig` ([#140](https://github.com/ferro-labs/ferrotunnel/issues/140)).
+- Return a generic 401 reason from the token-auth plugin so a missing token and
+  a wrong token are indistinguishable and the expected header name is not
+  disclosed ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+
+### Fixed
+
+- Make builder TLS configuration fail at `build()` time: a disabled config or
+  empty/incomplete certificate, key, or CA paths are now rejected instead of
+  silently leaving the transport unchanged ([#141](https://github.com/ferro-labs/ferrotunnel/issues/141)).
+- Propagate the CLI `--tls-client-auth`/`--tls-ca` validation error through
+  `main` instead of calling `std::process::exit`, so tracing and shutdown run
+  ([#142](https://github.com/ferro-labs/ferrotunnel/issues/142)).
+- Honor response-plugin `Reject`/`Respond` decisions on the HTTP/1 ingress path,
+  which previously discarded them ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+- Strip hop-by-hop headers on the HTTP/1 forward path, matching the HTTP/3 path,
+  while preserving them for WebSocket upgrades ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+- Propagate HTTP/3 request-body read errors instead of converting them to a
+  clean EOF that silently truncates the upstream body ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+- Fail stream-ID allocation when the ID space is exhausted instead of wrapping
+  and aliasing a live stream ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+- Capture the full request path and query for request replay so a replayed
+  request matches the original ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+- Report tracing/OTLP initialization failures instead of discarding them
+  ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+- Enforce the `HandshakeFrame` `min_version <= max_version` invariant during
+  frame validation ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+
+### Changed
+
+- Hide the `core`, `http`, and `protocol` implementation-crate re-exports from
+  the public API documentation ([#140](https://github.com/ferro-labs/ferrotunnel/issues/140)).
+- Unify the duplicate `rand` dependency on 0.9 and document the `cargo-deny`
+  duplicate-version policy ([#122](https://github.com/ferro-labs/ferrotunnel/issues/122)).
+- Align the advertised MSRV (README, CONTRIBUTING, CLI, Dockerfile) with the
+  1.91 toolchain used by the manifest and CI ([#123](https://github.com/ferro-labs/ferrotunnel/issues/123)).
+- Mark `Client::builder()` / `Server::builder()` `#[must_use]` and document the
+  `burst_factor` bound ([#145](https://github.com/ferro-labs/ferrotunnel/issues/145)).
+
+## [1.4.0] - 2026-07-03
+
+Protocol and configuration hardening release closing the v1.4.0 milestone.
+
+### Security
+
+- Validate every wire-frame variant in the decode path so oversized or
+  high-cardinality control-frame contents are rejected before use, closing an
+  allocation-amplification vector reachable by an authenticated peer ([#139](https://github.com/ferro-labs/ferrotunnel/issues/139)).
+- Bound the control-frame decode allocation to the frame size, so a small frame
+  can no longer force a large allocation while decoding, and large allocations
+  require a proportionally large frame ([#163](https://github.com/ferro-labs/ferrotunnel/issues/163)).
+
+### Fixed
+
+- Wire the configured frame/limit settings through to the codec so
+  `max_frame_bytes` is enforced by client and server, and reject a zero or
+  oversized configured limit ([#144](https://github.com/ferro-labs/ferrotunnel/issues/144)).
+- Install the rustls crypto provider automatically for embedded library TLS
+  users, so `Client`/`Server` builders no longer require a manual provider
+  install ([#121](https://github.com/ferro-labs/ferrotunnel/issues/121)).
+
 ## [1.3.0] - 2026-06-26
 
 Bug-fix and reliability release closing the v1.3.0 milestone.
@@ -106,7 +278,7 @@ Hardening release closing the v1.2.0 audit milestone.
 #### Dependencies
 - **quinn** 0.11 (optional, `quic` feature): QUIC implementation using rustls 0.23 + ring (already existing dependencies)
 
-## [1.0.6] - Unreleased
+## [1.0.6] - 2026-03-13
 
 ### Fixed
 
@@ -308,7 +480,11 @@ FerroTunnel v1.0.0 is the first stable release.
 | `ferrotunnel-observability` | Metrics, tracing, and dashboard |
 | `ferrotunnel-common` | Shared types and errors |
 
-[Unreleased]: https://github.com/ferro-labs/ferrotunnel/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/ferro-labs/ferrotunnel/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/ferro-labs/ferrotunnel/compare/v1.5.1...v1.5.2
+[1.5.1]: https://github.com/ferro-labs/ferrotunnel/compare/v1.5.0...v1.5.1
+[1.5.0]: https://github.com/ferro-labs/ferrotunnel/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/ferro-labs/ferrotunnel/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/ferro-labs/ferrotunnel/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/ferro-labs/ferrotunnel/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ferro-labs/ferrotunnel/compare/v1.0.8...v1.1.0

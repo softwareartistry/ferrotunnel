@@ -26,7 +26,7 @@
 //!         .build()?;
 //!
 //!     let info = client.start().await?;
-//!     println!("Connected! Session: {:?}", info.session_id);
+//!     println!("Connected! Session: {:?}", info.session_id());
 //!
 //!     // Keep running until Ctrl+C
 //!     tokio::signal::ctrl_c().await?;
@@ -43,8 +43,8 @@
 //! #[tokio::main]
 //! async fn main() -> ferrotunnel::Result<()> {
 //!     let mut server = Server::builder()
-//!         .bind("0.0.0.0:7835".parse().unwrap())
-//!         .http_bind("0.0.0.0:8080".parse().unwrap())
+//!         .bind("0.0.0.0:7835".parse().expect("valid tunnel bind"))
+//!         .http_bind("0.0.0.0:8080".parse().expect("valid HTTP bind"))
 //!         .token("my-secret-token")
 //!         .build()?;
 //!
@@ -75,10 +75,17 @@ pub mod client;
 pub mod config;
 pub mod server;
 
-// Re-export subcrates
+// Re-export the shared vocabulary crate (errors, `Result`, config types).
 pub use ferrotunnel_common as common;
+
+// Implementation crates are re-exported for advanced use but are not part of
+// the stable public API surface, so they are hidden from the generated docs.
+// The prelude re-exports the specific protocol types intended for public use.
+#[doc(hidden)]
 pub use ferrotunnel_core as core;
+#[doc(hidden)]
 pub use ferrotunnel_http as http;
+#[doc(hidden)]
 pub use ferrotunnel_protocol as protocol;
 
 // Public API exports

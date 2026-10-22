@@ -1,6 +1,6 @@
 //! Server subcommand implementation
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use ferrotunnel_core::TunnelServer;
 use ferrotunnel_observability::{
@@ -8,6 +8,7 @@ use ferrotunnel_observability::{
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{error, info};
 
 #[derive(Args, Debug)]
@@ -20,13 +21,18 @@ pub struct ServerArgs {
     #[arg(long, env = "FERROTUNNEL_TOKEN_FILE")]
     token_file: Option<PathBuf>,
 
-    /// Log level
+    /// Reserved CLI option; set RUST_LOG to configure log filtering
     #[arg(long, default_value = "info", env = "RUST_LOG")]
     log_level: String,
 
     /// HTTP Ingress bind address
     #[arg(long, default_value = "0.0.0.0:8080", env = "FERROTUNNEL_HTTP_BIND")]
     http_bind: SocketAddr,
+
+    /// Upstream response timeout in seconds for the HTTP/HTTP3 ingress;
+    /// raise it above the slowest legitimate upstream response (0 is rejected)
+    #[arg(long, default_value = "60", env = "FERROTUNNEL_HTTP_RESPONSE_TIMEOUT")]
+    http_response_timeout: u64,
 
     /// Metrics bind address
     #[arg(long, default_value = "0.0.0.0:9090", env = "FERROTUNNEL_METRICS_BIND")]
@@ -121,6 +127,8 @@ fn prompt_token() -> Result<String> {
 
 #[allow(clippy::too_many_lines)]
 pub async fn run(args: ServerArgs) -> Result<()> {
+    validate_args(&args)?;
+
     let enable_tracing = args.observability;
     let enable_metrics = args.metrics;
 
@@ -189,9 +197,6 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         if let Some(ca_path) = &args.tls_ca {
             info!("TLS Client Authentication enabled with CA: {:?}", ca_path);
             server = server.with_client_auth(ca_path.clone());
-        } else if args.tls_client_auth {
-            error!("--tls-client-auth requires --tls-ca to be provided");
-            std::process::exit(1);
         }
     }
     let sessions = server.sessions();
@@ -216,6 +221,8 @@ pub async fn run(args: ServerArgs) -> Result<()> {
 
     let registry = std::sync::Arc::new(registry);
 
+    let response_timeout = Duration::from_secs(args.http_response_timeout);
+
     #[cfg(feature = "http3")]
     let http3_start = if let Some(http3_addr) = args.http3_bind {
         let cert_path = args.http3_cert.clone().or(args.tls_cert.clone());
@@ -231,7 +238,8 @@ pub async fn run(args: ServerArgs) -> Result<()> {
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string()),
             )
-            .client_auth(args.tls_client_auth);
+            .client_auth(args.tls_client_auth)
+            .response_timeout(response_timeout);
             let alt_svc = http3_config.alt_svc_header_value(http3_addr).ok();
             Some((http3_addr, http3_config, alt_svc))
         } else {
@@ -242,9 +250,20 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         None
     };
 
-    info!("Starting HTTP Ingress on {}", args.http_bind);
-    let http_ingress =
-        ferrotunnel_http::HttpIngress::new(args.http_bind, sessions.clone(), registry.clone());
+    info!(
+        "Starting HTTP Ingress on {} (upstream response timeout: {}s)",
+        args.http_bind, args.http_response_timeout
+    );
+    let ingress_config = ferrotunnel_http::IngressConfig {
+        response_timeout,
+        ..Default::default()
+    };
+    let http_ingress = ferrotunnel_http::HttpIngress::with_config(
+        args.http_bind,
+        sessions.clone(),
+        registry.clone(),
+        ingress_config,
+    );
     #[cfg(feature = "http3")]
     let http_ingress = if let Some((_, _, Some(alt_svc))) = &http3_start {
         http_ingress.with_alt_svc_header(alt_svc.clone())
@@ -314,7 +333,8 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     registry
         .init_all()
         .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        .map_err(anyhow::Error::from_boxed)
+        .context("Failed to initialize plugins")?;
 
     // Run services until shutdown signal
     tokio::select! {
@@ -356,10 +376,56 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     Ok(())
 }
 
+fn validate_args(args: &ServerArgs) -> Result<()> {
+    if args.tls_client_auth && args.tls_ca.is_none() {
+        return Err(anyhow!(
+            "--tls-client-auth requires --tls-ca to be provided"
+        ));
+    }
+
+    if args.http_response_timeout == 0 {
+        return Err(anyhow!(
+            "--http-response-timeout (FERROTUNNEL_HTTP_RESPONSE_TIMEOUT) must be greater than 0"
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn server_args() -> ServerArgs {
+        ServerArgs {
+            bind: SocketAddr::from(([127, 0, 0, 1], 7835)),
+            token_file: None,
+            log_level: "info".to_string(),
+            http_bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            http_response_timeout: 60,
+            metrics_bind: SocketAddr::from(([127, 0, 0, 1], 9090)),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            tls_client_auth: false,
+            tcp_bind: None,
+            #[cfg(feature = "http3")]
+            http3_bind: None,
+            #[cfg(feature = "http3")]
+            http3_cert: None,
+            #[cfg(feature = "http3")]
+            http3_key: None,
+            observability: false,
+            metrics: false,
+            #[cfg(feature = "quic")]
+            quic_bind: None,
+            #[cfg(feature = "quic")]
+            quic_cert: None,
+            #[cfg(feature = "quic")]
+            quic_key: None,
+        }
+    }
 
     #[test]
     fn read_token_file_trims_trailing_line_endings() {
@@ -376,5 +442,61 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(token, "secret");
+    }
+
+    #[test]
+    fn tls_client_auth_requires_ca() {
+        let args = ServerArgs {
+            tls_client_auth: true,
+            ..server_args()
+        };
+
+        let error = validate_args(&args).err().map(|err| err.to_string());
+
+        assert_eq!(
+            error.as_deref(),
+            Some("--tls-client-auth requires --tls-ca to be provided")
+        );
+    }
+
+    #[test]
+    fn tls_client_auth_accepts_ca() {
+        let args = ServerArgs {
+            tls_client_auth: true,
+            tls_ca: Some(PathBuf::from("ca.pem")),
+            ..server_args()
+        };
+
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn zero_http_response_timeout_is_rejected() {
+        let args = ServerArgs {
+            http_response_timeout: 0,
+            ..server_args()
+        };
+
+        let error = validate_args(&args).err().map(|err| err.to_string());
+
+        assert_eq!(
+            error.as_deref(),
+            Some("--http-response-timeout (FERROTUNNEL_HTTP_RESPONSE_TIMEOUT) must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn default_http_response_timeout_comes_from_the_parser() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ServerArgs,
+        }
+
+        let cli = Cli::parse_from(["server"]);
+        assert_eq!(cli.args.http_response_timeout, 60);
+        assert!(validate_args(&cli.args).is_ok());
     }
 }

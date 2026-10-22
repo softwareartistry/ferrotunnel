@@ -13,18 +13,19 @@
 //!     .build()?;
 //!
 //! let info = client.start().await?;
-//! println!("Connected! Session: {:?}", info.session_id);
+//! println!("Connected! Session: {:?}", info.session_id());
 //! # Ok(())
 //! # }
 //! ```
 
 use crate::config::{ClientConfig, TunnelInfo};
-use ferrotunnel_common::config::TlsConfig;
+use ferrotunnel_common::config::{LimitsConfig, TlsConfig};
 use ferrotunnel_common::{Result, TunnelError};
 use ferrotunnel_core::transport::{tls::TlsTransportConfig, TransportConfig};
 use ferrotunnel_core::TunnelClient;
 use ferrotunnel_http::HttpProxy;
 use ferrotunnel_protocol::frame::Protocol;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
@@ -51,6 +52,7 @@ pub struct Client {
 pub struct ClientBuilder {
     config: ClientConfig,
     transport_config: Option<TransportConfig>,
+    tls_validation_error: Option<TunnelError>,
 }
 
 impl Client {
@@ -65,8 +67,9 @@ impl Client {
     ///     .server_addr("localhost:7835")
     ///     .token("secret")
     ///     .build()
-    ///     .unwrap();
+    ///     .expect("valid client configuration");
     /// ```
+    #[must_use]
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
     }
@@ -100,6 +103,7 @@ impl Client {
         let auto_reconnect = config.auto_reconnect;
         let reconnect_delay = config.reconnect_delay;
         let startup_timeout = config.startup_timeout;
+        let limits = config.limits.clone();
         let transport_config = self.transport_config.clone();
 
         let info_tx = Arc::new(Mutex::new(Some(info_tx)));
@@ -117,7 +121,8 @@ impl Client {
 
             loop {
                 let mut client = TunnelClient::new(server_addr.clone(), token.clone())
-                    .with_transport(transport_config.clone());
+                    .with_transport(transport_config.clone())
+                    .with_limits(limits.clone());
                 if let Some(ref id) = tunnel_id {
                     client = client.with_tunnel_id(id.clone());
                 }
@@ -353,13 +358,32 @@ impl ClientBuilder {
         self
     }
 
+    /// Configure resource limits (frame size, session, and stream bounds).
+    ///
+    /// Defaults to [`LimitsConfig::default`]. A `max_frame_bytes` of `0` or a
+    /// value larger than `u32::MAX` is rejected by [`ClientBuilder::build`].
+    #[must_use]
+    pub fn limits(mut self, limits: &LimitsConfig) -> Self {
+        self.config.limits = limits.clone();
+        self
+    }
+
     /// Configure TLS for the connection.
     ///
     /// When enabled, the client will use TLS to connect to the server.
     #[must_use]
     pub fn tls(mut self, config: &TlsConfig) -> Self {
-        if let Some(tls) = TlsTransportConfig::from_common(config) {
-            self.transport_config = Some(TransportConfig::Tls(tls));
+        match validate_client_tls_config(config) {
+            Ok(()) => {
+                self.tls_validation_error = None;
+                if let Some(tls) = TlsTransportConfig::from_common(config) {
+                    self.transport_config = Some(TransportConfig::Tls(tls));
+                }
+            }
+            Err(error) => {
+                self.tls_validation_error = Some(error);
+                self.transport_config = None;
+            }
         }
         self
     }
@@ -367,14 +391,15 @@ impl ClientBuilder {
     /// Configure QUIC transport for the client.
     ///
     /// When enabled, the client will connect to the server using QUIC.
-    /// QUIC provides built-in encryption, native stream multiplexing,
-    /// and optional 0-RTT reconnection.
+    /// QUIC provides built-in encryption and native stream multiplexing.
+    /// The 0-RTT option currently falls back to a full handshake.
     #[cfg(feature = "quic")]
     #[must_use]
     pub fn quic(mut self, config: &ferrotunnel_common::QuicConfig) -> Self {
         if let Some(quic) =
             ferrotunnel_core::transport::quic::QuicTransportConfig::from_common(config)
         {
+            self.tls_validation_error = None;
             self.transport_config = Some(TransportConfig::Quic(quic));
         }
         self
@@ -389,6 +414,9 @@ impl ClientBuilder {
     /// - `token` must be set
     pub fn build(self) -> Result<Client> {
         self.config.validate()?;
+        if let Some(error) = self.tls_validation_error {
+            return Err(error);
+        }
         Ok(Client {
             config: self.config,
             transport_config: self.transport_config.unwrap_or_default(),
@@ -398,9 +426,47 @@ impl ClientBuilder {
     }
 }
 
+fn validate_client_tls_config(config: &TlsConfig) -> Result<()> {
+    if !config.enabled {
+        return Err(TunnelError::Config(
+            "TLS config is disabled; omit ClientBuilder::tls() or enable TLS".into(),
+        ));
+    }
+
+    // `skip_verify` disables server-certificate verification, so no CA is
+    // required (this matches what `create_client_config` accepts). Only require
+    // a CA when the server certificate will actually be verified.
+    if !config.skip_verify && missing_path(config.ca_cert_path.as_ref()) {
+        return Err(TunnelError::Config(
+            "client TLS requires ca_cert_path for server verification".into(),
+        ));
+    }
+
+    let has_cert = !missing_path(config.cert_path.as_ref());
+    let has_key = !missing_path(config.key_path.as_ref());
+    if config.client_auth && (!has_cert || !has_key) {
+        return Err(TunnelError::Config(
+            "client TLS client_auth requires cert_path and key_path".into(),
+        ));
+    }
+
+    if has_cert != has_key {
+        return Err(TunnelError::Config(
+            "client TLS certificate and key paths must be provided together".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn missing_path(path: Option<&PathBuf>) -> bool {
+    path.is_none_or(|path| path.as_os_str().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_client_builder_success() {
@@ -420,6 +486,10 @@ mod tests {
             .local_addr("127.0.0.1:3000")
             .auto_reconnect(false)
             .reconnect_delay(Duration::from_secs(10))
+            .limits(&LimitsConfig {
+                max_frame_bytes: 4096,
+                ..Default::default()
+            })
             .build()
             .expect("should build successfully");
 
@@ -428,6 +498,7 @@ mod tests {
         assert_eq!(client.config().local_addr, "127.0.0.1:3000");
         assert!(!client.config().auto_reconnect);
         assert_eq!(client.config().reconnect_delay, Duration::from_secs(10));
+        assert_eq!(client.config().limits.max_frame_bytes, 4096);
     }
 
     #[test]
@@ -511,14 +582,107 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
+        let result = Client::builder()
+            .server_addr("localhost:7835")
+            .token("secret")
+            .tls(&tls)
+            .build();
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("TLS config is disabled"));
+    }
+
+    #[test]
+    fn test_client_builder_tls_missing_ca() {
+        let tls = TlsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let result = Client::builder()
+            .server_addr("localhost:7835")
+            .token("secret")
+            .tls(&tls)
+            .build();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ca_cert_path"));
+    }
+
+    #[test]
+    fn test_client_builder_tls_rejects_partial_client_auth_material() {
+        let tls = TlsConfig {
+            enabled: true,
+            ca_cert_path: Some(PathBuf::from("ca.pem")),
+            cert_path: Some(PathBuf::from("client.pem")),
+            ..Default::default()
+        };
+        let result = Client::builder()
+            .server_addr("localhost:7835")
+            .token("secret")
+            .tls(&tls)
+            .build();
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("provided together"));
+    }
+
+    #[test]
+    fn test_client_builder_tls_rejects_client_auth_without_material() {
+        let tls = TlsConfig {
+            enabled: true,
+            ca_cert_path: Some(PathBuf::from("ca.pem")),
+            client_auth: true,
+            ..Default::default()
+        };
+        let result = Client::builder()
+            .server_addr("localhost:7835")
+            .token("secret")
+            .tls(&tls)
+            .build();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("client_auth"));
+    }
+
+    #[test]
+    fn test_client_builder_tls_ca_only() {
+        let tls = TlsConfig {
+            enabled: true,
+            ca_cert_path: Some(PathBuf::from("ca.pem")),
+            ..Default::default()
+        };
         let client = Client::builder()
             .server_addr("localhost:7835")
             .token("secret")
             .tls(&tls)
             .build()
-            .expect("should build");
+            .expect("server-auth TLS should not require client certificate material");
 
-        // TLS disabled means no transport config set
+        assert!(!client.config().server_addr.is_empty());
+    }
+
+    #[test]
+    fn test_client_builder_tls_skip_verify_without_ca() {
+        // `skip_verify` disables server verification, so a CA is not required;
+        // the transport supports this, so `build()` must accept it.
+        let tls = TlsConfig {
+            enabled: true,
+            skip_verify: true,
+            ..Default::default()
+        };
+        let client = Client::builder()
+            .server_addr("localhost:7835")
+            .token("secret")
+            .tls(&tls)
+            .build()
+            .expect("skip_verify TLS should not require a CA path");
+
         assert!(!client.config().server_addr.is_empty());
     }
 }

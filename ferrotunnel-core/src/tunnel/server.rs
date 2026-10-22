@@ -1,4 +1,5 @@
 use crate::auth::{constant_time_eq, validate_token_format};
+use crate::rate_limit::SessionRateLimiter;
 use crate::resource_limits::{ServerResourceLimits, SessionPermit};
 use crate::stream::{AnyMultiplexer, Multiplexer, PrioritizedFrame};
 use crate::transport::batched_sender::run_batched_sender;
@@ -6,7 +7,7 @@ use crate::transport::{self, BoxedStream, TransportConfig};
 use crate::tunnel::accept_backoff::{is_transient_accept_error, AcceptBackoff};
 use crate::tunnel::common::{clamp_u128_to_u64, read_initial_handshake_frame};
 use crate::tunnel::session::{Session, SessionStoreBackend, ShardedSessionStore};
-use ferrotunnel_common::{Result, TunnelError};
+use ferrotunnel_common::{LimitsConfig, RateLimitConfig, Result, TunnelError};
 use ferrotunnel_protocol::codec::TunnelCodec;
 use ferrotunnel_protocol::constants::{MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION};
 use ferrotunnel_protocol::frame::{CloseReason, Frame, HandshakeFrame, HandshakeStatus};
@@ -18,7 +19,7 @@ use tokio::net::TcpListener;
 #[cfg(feature = "quic")]
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[cfg(feature = "quic")]
@@ -45,6 +46,8 @@ pub struct TunnelServer {
     /// guarded so exactly one cleanup loop runs per server instance even if both
     /// `run` and `run_quic` are invoked.
     cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+    limits_config: LimitsConfig,
+    rate_limits: RateLimitConfig,
 }
 
 impl Drop for TunnelServer {
@@ -68,6 +71,8 @@ impl TunnelServer {
             resource_limits: ServerResourceLimits::default(),
             transport_config: TransportConfig::default(),
             cleanup_handle: None,
+            limits_config: LimitsConfig::default(),
+            rate_limits: RateLimitConfig::default(),
         }
     }
 
@@ -87,6 +92,29 @@ impl TunnelServer {
     #[must_use]
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Set the resource limits used to build the frame codec (frame size and
+    /// control-frame validation bounds).
+    #[must_use]
+    pub fn with_limits(mut self, limits: LimitsConfig) -> Self {
+        self.limits_config = limits;
+        self
+    }
+
+    /// Set the per-session rate limits applied to every accepted session.
+    ///
+    /// Over-budget data frames are throttled (delayed and delivered) rather
+    /// than dropped. Note that a very low byte rate combined with a large
+    /// `max_frame_bytes` can park a session for a long time: a frame larger
+    /// than the burst capacity waits for quota chunk by chunk. Each chunk is
+    /// bounded to roughly thirty seconds of quota, and the session heartbeat
+    /// is refreshed between chunks, so a long throttle is never evicted as
+    /// stale regardless of the configured rate.
+    #[must_use]
+    pub fn with_rate_limits(mut self, limits: RateLimitConfig) -> Self {
+        self.rate_limits = limits;
         self
     }
 
@@ -176,6 +204,8 @@ impl TunnelServer {
     }
 
     pub async fn run(mut self) -> Result<()> {
+        crate::limits::validate_limits(&self.limits_config)?;
+        crate::limits::validate_rate_limits(&self.rate_limits)?;
         let listener = TcpListener::bind(self.addr).await?;
         info!("Server listening on {}", self.addr);
 
@@ -225,6 +255,8 @@ impl TunnelServer {
 
             let sessions = sessions.clone();
             let token = self.auth_token.clone();
+            let limits = self.limits_config.clone();
+            let rate_limits = self.rate_limits.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = Self::handle_connection(
@@ -234,6 +266,8 @@ impl TunnelServer {
                     token,
                     session_permit,
                     handshake_timeout,
+                    limits,
+                    rate_limits,
                 )
                 .await
                 {
@@ -243,7 +277,7 @@ impl TunnelServer {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn handle_connection(
         stream: BoxedStream,
         addr: SocketAddr,
@@ -251,8 +285,10 @@ impl TunnelServer {
         expected_token: String,
         _session_permit: SessionPermit,
         handshake_timeout: Duration,
+        limits_config: LimitsConfig,
+        rate_limits: RateLimitConfig,
     ) -> Result<()> {
-        let mut framed = Framed::new(stream, TunnelCodec::new());
+        let mut framed = Framed::new(stream, TunnelCodec::from_limits(&limits_config));
 
         // 1. Handshake
         let frame = read_initial_handshake_frame(&mut framed, handshake_timeout, "server").await?;
@@ -306,14 +342,22 @@ impl TunnelServer {
                     }
                 });
 
+                // The limiter is shared with the multiplexer so the ingress's own
+                // stream opens are metered too: `process_messages` only sees
+                // `OpenStream` frames sent by the client, never the ones the
+                // ingress opens on its behalf.
+                let rate_limiter = SessionRateLimiter::new(&rate_limits.into());
                 let session = Session::new(
                     session_id,
                     tunnel_id.clone(),
                     addr,
                     token,
                     capabilities,
-                    Some(AnyMultiplexer::Tcp(multiplexer.clone())),
-                );
+                    Some(AnyMultiplexer::Tcp(
+                        multiplexer.clone().with_rate_limiter(rate_limiter.clone()),
+                    )),
+                )
+                .with_rate_limiter(rate_limiter);
 
                 if let Err(e) = sessions.add(session) {
                     warn!("Failed to register session: {}", e);
@@ -357,6 +401,7 @@ impl TunnelServer {
         sessions: SessionStoreBackend,
         multiplexer: Multiplexer,
     ) -> Result<()> {
+        let mut throttling = false;
         loop {
             #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
             let decode_start = Instant::now();
@@ -383,7 +428,8 @@ impl TunnelServer {
             };
 
             // Enforce per-session rate limits on the hot path (issue #119).
-            // Fail closed: deny stream opens and drop data frames when over limit.
+            // Deny stream opens when over limit; throttle over-budget data frames
+            // instead of dropping them so the tunneled byte stream stays intact.
             if let Some(limiter) = &rate_limiter {
                 match &frame {
                     Frame::OpenStream(open) if limiter.check_stream_open().is_err() => {
@@ -403,13 +449,33 @@ impl TunnelServer {
                         continue;
                     }
                     Frame::Data { data, .. } if limiter.check_data(data.len()).is_err() => {
-                        warn!(
+                        if !throttling {
+                            throttling = true;
+                            warn!(
+                                session_id = %session_id,
+                                bytes = data.len(),
+                                "Data rate limit exceeded; throttling session"
+                            );
+                        }
+                        debug!(
                             session_id = %session_id,
                             bytes = data.len(),
-                            "Data rate limit exceeded; dropping data frame"
+                            "Throttling over-budget data frame"
                         );
-                        continue;
+                        // Deliberate head-of-line blocking: the byte budget is
+                        // session-wide, so every stream on this session stalls while
+                        // one is over budget; backpressure reaches the client through
+                        // TCP flow control instead of dropping frames mid-stream.
+                        limiter
+                            .throttle_data(data.len(), || {
+                                // Touch the heartbeat so a long throttle is not evicted as stale.
+                                if let Some(mut session) = sessions.get_mut(&session_id) {
+                                    session.update_heartbeat();
+                                }
+                            })
+                            .await;
                     }
+                    Frame::Data { .. } => throttling = false,
                     _ => {}
                 }
             }
@@ -446,6 +512,8 @@ impl TunnelServer {
     /// This is separate from `run()` which uses TCP. Both can run simultaneously
     /// on different ports.
     pub async fn run_quic(mut self, quic_addr: SocketAddr) -> Result<()> {
+        crate::limits::validate_limits(&self.limits_config)?;
+        crate::limits::validate_rate_limits(&self.rate_limits)?;
         let quic_config = match &self.transport_config {
             TransportConfig::Quic(c) => c.clone(),
             _ => {
@@ -502,6 +570,8 @@ impl TunnelServer {
 
             let sessions = sessions.clone();
             let token = self.auth_token.clone();
+            let limits = self.limits_config.clone();
+            let rate_limits = self.rate_limits.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = Self::handle_quic_connection(
@@ -511,6 +581,8 @@ impl TunnelServer {
                     token,
                     session_permit,
                     handshake_timeout,
+                    limits,
+                    rate_limits,
                 )
                 .await
                 {
@@ -524,7 +596,7 @@ impl TunnelServer {
     ///
     /// Uses the first bidirectional stream as a control channel for handshake and heartbeats.
     /// Subsequent bidirectional streams carry data (each QUIC stream = one tunnel stream).
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn handle_quic_connection(
         connection: quinn::Connection,
         addr: SocketAddr,
@@ -532,6 +604,8 @@ impl TunnelServer {
         expected_token: String,
         _session_permit: SessionPermit,
         handshake_timeout: Duration,
+        limits_config: LimitsConfig,
+        rate_limits: RateLimitConfig,
     ) -> Result<()> {
         // Accept the control stream (first bidi stream opened by client)
         let (ctrl_send, ctrl_recv) = match timeout(handshake_timeout, connection.accept_bi()).await
@@ -551,9 +625,11 @@ impl TunnelServer {
         };
 
         let mut ctrl_framed_recv =
-            tokio_util::codec::FramedRead::new(ctrl_recv, TunnelCodec::new());
-        let mut ctrl_framed_send =
-            tokio_util::codec::FramedWrite::new(ctrl_send, TunnelCodec::new());
+            tokio_util::codec::FramedRead::new(ctrl_recv, TunnelCodec::from_limits(&limits_config));
+        let mut ctrl_framed_send = tokio_util::codec::FramedWrite::new(
+            ctrl_send,
+            TunnelCodec::from_limits(&limits_config),
+        );
 
         // 1. Handshake on control stream
         let frame = match read_initial_handshake_frame(
@@ -596,8 +672,15 @@ impl TunnelServer {
                     capabilities,
                 } = auth;
 
-                // Create QUIC multiplexer for data streams
-                let quic_mux = QuicMultiplexer::new(connection.clone(), false);
+                // Create QUIC multiplexer for data streams.
+                //
+                // The limiter is shared with the multiplexer, not just stored on
+                // the session: QUIC data never reaches `process_messages`, so
+                // `AnyMultiplexer::open_stream` is the only place the budget can
+                // be applied to this transport.
+                let rate_limiter = SessionRateLimiter::new(&rate_limits.into());
+                let quic_mux = QuicMultiplexer::new(connection.clone(), false)
+                    .with_rate_limiter(rate_limiter.clone());
 
                 let session = Session::new(
                     session_id,
@@ -606,7 +689,8 @@ impl TunnelServer {
                     token,
                     capabilities,
                     Some(AnyMultiplexer::Quic(quic_mux.clone())),
-                );
+                )
+                .with_rate_limiter(rate_limiter);
 
                 if let Err(e) = sessions.add(session) {
                     warn!("Failed to register QUIC session: {}", e);
@@ -835,6 +919,8 @@ mod tests {
             "token".to_string(),
             permit,
             Duration::from_millis(1),
+            LimitsConfig::default(),
+            RateLimitConfig::default(),
         )
         .await
         .unwrap_err();
@@ -844,6 +930,27 @@ mod tests {
             TunnelError::Timeout(msg) if msg.contains("server handshake timed out")
         ));
         assert_eq!(limits.available_sessions(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_rejects_unrepresentable_rate_limits_before_binding() {
+        // Port 0 would bind successfully, so reaching an error at all proves
+        // validation runs ahead of the listener rather than after it.
+        let server = TunnelServer::new("127.0.0.1:0".parse().unwrap(), "token".to_string())
+            .with_rate_limits(RateLimitConfig {
+                bytes_per_sec: u64::from(u32::MAX) + 1,
+                ..Default::default()
+            });
+
+        let err = server
+            .run()
+            .await
+            .expect_err("a byte rate the limiter cannot represent must be rejected");
+
+        assert!(
+            matches!(err, TunnelError::Config(ref msg) if msg.contains("bytes_per_sec")),
+            "error should identify the field: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1003,9 +1110,9 @@ mod tests {
         .with_rate_limiter(SessionRateLimiter::new(&tight));
         sessions.add(session).unwrap();
 
-        // Open stream 1, send 8 bytes (the whole 8-byte budget), then 8 more
-        // bytes (over budget -> must be dropped by the Frame::Data limiter arm).
         let mut client = Framed::new(client_side, TunnelCodec::new());
+        // Open stream 1, send 8 bytes (the whole 8-byte budget), then 8 more
+        // bytes (over budget -> must be throttled by the Frame::Data limiter arm).
         client
             .send(Frame::OpenStream(Box::new(OpenStreamFrame {
                 stream_id: 1,
@@ -1033,23 +1140,29 @@ mod tests {
         let (read_half, _write_half) = tokio::io::split(server_stream);
         let framed_read = tokio_util::codec::FramedRead::new(read_half, TunnelCodec::new());
         // Keep a multiplexer clone alive so the opened stream's channel stays open
-        // after `process_messages` returns; otherwise a dropped (rate-limited) frame
+        // after `process_messages` returns; otherwise a lost (rate-limited) frame
         // would be indistinguishable from channel-close EOF.
         let _keepalive = multiplexer.clone();
+        let started = Instant::now();
         TunnelServer::process_messages(framed_read, session_id, sessions, multiplexer)
             .await
             .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "over-budget data frame must be throttled (delayed), got {:?}",
+            started.elapsed()
+        );
 
-        // The opened stream receives only the first (in-budget) data frame; the
-        // second is dropped, so a follow-up read has nothing more to deliver.
+        // The opened stream receives both data frames intact and in order; the
+        // second is delayed by the throttle instead of dropped.
         let mut stream = new_stream_rx.recv().await.unwrap();
         let mut buf = vec![0u8; 64];
         let first = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..first], b"AAAAAAAA");
-        let second = timeout(Duration::from_millis(300), stream.read(&mut buf)).await;
-        assert!(
-            second.is_err(),
-            "over-budget data frame must be dropped by the rate limiter"
-        );
+        let second = timeout(Duration::from_millis(300), stream.read(&mut buf))
+            .await
+            .expect("over-budget data frame must be delivered after throttling, not dropped")
+            .unwrap();
+        assert_eq!(&buf[..second], b"BBBBBBBB");
     }
 }

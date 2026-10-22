@@ -63,14 +63,24 @@ impl Default for LimitsConfig {
     }
 }
 
-/// Rate limiting configuration
+/// Rate limiting configuration.
+///
+/// The limiter counts in `u32` cells, so every field must be non-zero and
+/// `bytes_per_sec` must fit in a `u32`. Both `ferrotunnel::ServerBuilder::build`
+/// and `ferrotunnel_core::TunnelServer::run` reject values outside that range,
+/// so a rate the limiter cannot represent fails at startup instead of being
+/// silently clamped to a more restrictive one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
-    /// Maximum new streams per second per session
+    /// Maximum new streams per second per session.
     pub streams_per_sec: u32,
-    /// Maximum bytes per second per session
+    /// Maximum bytes per second per session.
     pub bytes_per_sec: u64,
-    /// Burst allowance multiplier
+    /// Burst allowance multiplier applied to the per-second rates.
+    ///
+    /// The effective burst capacity is `rate * burst_factor`, saturating at
+    /// `u32::MAX`. Values beyond a small single-digit multiple offer no
+    /// practical benefit.
     pub burst_factor: u32,
 }
 
@@ -97,7 +107,7 @@ pub struct QuicConfig {
     pub ca_cert_path: Option<PathBuf>,
     /// Server name for SNI (client-side)
     pub server_name: Option<String>,
-    /// Enable 0-RTT for faster reconnection (vulnerable to replay — use with caution)
+    /// Request 0-RTT on reconnect; currently falls back to a full handshake
     pub enable_0rtt: bool,
     /// Maximum idle timeout in seconds (default: 30)
     pub max_idle_timeout_secs: Option<u64>,

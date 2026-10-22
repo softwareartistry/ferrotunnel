@@ -69,15 +69,24 @@ Internet → HttpIngress(:8080) → SessionStore → AnyMultiplexer → [TCP: Mu
 - **`unsafe_code = "forbid"`** at workspace level — no unsafe code
 - **Clippy pedantic** enabled; `unwrap_used` and `expect_used` warn (allowed in tests)
 - `dbg!`, `todo!`, `unimplemented!` are warnings
-- Edition 2021, MSRV 1.90, max line width 100, 4-space indent
+- Edition 2021, MSRV 1.91, max line width 100, 4-space indent
 - Use `thiserror` for library errors, `anyhow` for CLI/application errors
 - Prefer `Bytes` for zero-copy buffers, `kanal` for async channels, `DashMap` for concurrent maps
 - TLS uses `rustls` 0.23 + ring crypto provider (must call `install_default()` before any TLS config)
+
+## Public-Facing Wording
+
+Keep all public-facing text — commit messages, rustdoc (`///` doc comments),
+`CHANGELOG.md`, `ROADMAP.md`, and GitHub issues/PRs — **neutral and
+outcome-focused**. Do **not** reference internal tooling, code-review services,
+AI assistants, private decisions, or how the change was produced; describe
+*what* changed and *why* it matters to users. Commit messages stay short and
+imperative; rustdoc stays brief with no meta-commentary or disclaimers.
 
 ## Publishing
 
 Crates must be published in dependency order:
 ```
-ferrotunnel-common → ferrotunnel-protocol → ferrotunnel-plugin → ferrotunnel-core → ferrotunnel-observability → ferrotunnel-http → ferrotunnel → ferrotunnel-cli
+ferrotunnel-common → ferrotunnel-protocol → ferrotunnel-plugin → ferrotunnel-observability → ferrotunnel-core → ferrotunnel-http → ferrotunnel → ferrotunnel-cli
 ```
 Use `make publish-dry-run` to validate, `make publish` (runs `scripts/publish.sh`) for production.
