@@ -30,8 +30,13 @@ pub struct ServerArgs {
     http_bind: SocketAddr,
 
     /// Upstream response timeout in seconds for the HTTP/HTTP3 ingress;
-    /// raise it above the slowest legitimate upstream response (0 is rejected)
-    #[arg(long, default_value = "60", env = "FERROTUNNEL_HTTP_RESPONSE_TIMEOUT")]
+    /// raise it above the slowest legitimate upstream response (0 is rejected).
+    /// Default 1h: a Flight SQL query can run for many minutes before its first row
+    #[arg(
+        long,
+        default_value = "3600",
+        env = "FERROTUNNEL_HTTP_RESPONSE_TIMEOUT"
+    )]
     http_response_timeout: u64,
 
     /// Metrics bind address
@@ -496,7 +501,7 @@ mod tests {
         }
 
         let cli = Cli::parse_from(["server"]);
-        assert_eq!(cli.args.http_response_timeout, 60);
+        assert_eq!(cli.args.http_response_timeout, 3600);
         assert!(validate_args(&cli.args).is_ok());
     }
 }
