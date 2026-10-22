@@ -423,6 +423,10 @@ pub struct VirtualStream {
     pending_send_len: usize,
     /// Protocol for this stream
     protocol: Protocol,
+    /// The peer ended the stream normally; later reads stay EOF.
+    peer_closed: bool,
+    /// We sent our normal close; dropping needs no further signal.
+    close_sent: bool,
 }
 
 impl std::fmt::Debug for VirtualStream {
@@ -458,6 +462,8 @@ impl VirtualStream {
             pending_send: None,
             pending_send_len: 0,
             protocol,
+            peer_closed: false,
+            close_sent: false,
         }
     }
 
@@ -476,6 +482,33 @@ impl Drop for VirtualStream {
         if let Some(pool) = self.buffer_pool.take() {
             let buffer = std::mem::take(&mut self.read_buffer);
             pool.release(buffer);
+        }
+        // Dropped without a close: tell the peer, or it waits on this stream forever.
+        // Normal only if the peer already ended it; otherwise this end is abnormal.
+        if !self.close_sent {
+            let reason = if self.peer_closed {
+                ferrotunnel_protocol::frame::CloseReason::Normal
+            } else {
+                ferrotunnel_protocol::frame::CloseReason::Error("stream dropped".into())
+            };
+            let frame = (
+                self.priority,
+                Frame::CloseStream {
+                    stream_id: self.stream_id,
+                    reason,
+                },
+            );
+            // Full channel: queue it behind the data instead of losing it. An error
+            // means the session is gone, and its teardown already fails the peer.
+            let mut item = Some(frame);
+            if let Ok(false) = self.tx.try_send_option(&mut item) {
+                if let (Some(frame), Ok(handle)) = (item, tokio::runtime::Handle::try_current()) {
+                    let tx = self.tx.clone();
+                    handle.spawn(async move {
+                        let _ = send_prioritized_frame(&tx, frame).await;
+                    });
+                }
+            }
         }
     }
 }
@@ -515,6 +548,11 @@ impl AsyncRead for VirtualStream {
             return Poll::Ready(Ok(()));
         }
 
+        // A normal close already ended the stream; never wait on the channel again.
+        if self.peer_closed {
+            return Poll::Ready(Ok(()));
+        }
+
         // Check if we have a pending receive future
         if self.pending_recv.is_none() {
             let rx = self.rx.clone();
@@ -538,12 +576,31 @@ impl AsyncRead for VirtualStream {
                         }
                         Poll::Ready(Ok(()))
                     }
-                    Ok(Ok(Frame::CloseStream { .. })) | Err(ReceiveError::Closed) => {
+                    Ok(Ok(Frame::CloseStream {
+                        reason: ferrotunnel_protocol::frame::CloseReason::Normal,
+                        ..
+                    })) => {
+                        self.peer_closed = true;
                         Poll::Ready(Ok(())) // EOF
                     }
+                    // Any other close is abnormal: an error, never a clean end of data.
+                    Ok(Ok(Frame::CloseStream { reason, .. })) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        format!("stream closed: {reason:?}"),
+                    ))),
                     Ok(Ok(_)) => Poll::Pending, // Ignore other frame types
                     Ok(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-                    Err(ReceiveError::SendClosed) => Poll::Ready(Ok(())), // EOF
+                    // The channel went away without a normal close (session teardown,
+                    // failed delivery): abnormal unless the peer already ended it.
+                    Err(ReceiveError::SendClosed | ReceiveError::Closed) if self.peer_closed => {
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(ReceiveError::SendClosed | ReceiveError::Closed) => {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "stream ended without close",
+                        )))
+                    }
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -640,6 +697,7 @@ impl AsyncWrite for VirtualStream {
         match fut.as_mut().poll(cx) {
             Poll::Ready(result) => {
                 self.pending_send = None;
+                self.close_sent = result.is_ok();
                 Poll::Ready(result)
             }
             Poll::Pending => Poll::Pending,
@@ -650,6 +708,7 @@ impl AsyncWrite for VirtualStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrotunnel_protocol::frame::CloseReason;
     use tokio::time::timeout;
 
     #[tokio::test]
@@ -799,6 +858,102 @@ mod tests {
 
         assert_eq!(first, STREAM_B, "fast stream B must complete first");
         assert_eq!(second, STREAM_A, "slow stream A must complete last");
+    }
+
+    /// A server-side stream plus the receiver of every frame it sends.
+    async fn stream_with_wire() -> (Multiplexer, VirtualStream, AsyncReceiver<PrioritizedFrame>) {
+        let (frame_tx, frame_rx) = bounded_async::<PrioritizedFrame>(64);
+        let (mux, new_stream_rx) = Multiplexer::new(frame_tx, false);
+        mux.process_frame(Frame::OpenStream(Box::new(OpenStreamFrame {
+            stream_id: 2,
+            protocol: Protocol::GRPC,
+            headers: vec![],
+            body_hint: None,
+            priority: StreamPriority::default(),
+        })))
+        .await
+        .unwrap();
+        let stream = new_stream_rx.recv().await.unwrap();
+        (mux, stream, frame_rx)
+    }
+
+    fn sent_closes(wire: &AsyncReceiver<PrioritizedFrame>) -> Vec<CloseReason> {
+        let mut out = vec![];
+        while let Ok(Some((_, frame))) = wire.try_recv() {
+            if let Frame::CloseStream { reason, .. } = frame {
+                out.push(reason);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_tells_the_peer_with_an_error() {
+        let (_mux, stream, wire) = stream_with_wire().await;
+        drop(stream);
+        assert!(matches!(sent_closes(&wire)[..], [CloseReason::Error(_)]));
+    }
+
+    #[tokio::test]
+    async fn normal_shutdown_sends_one_normal_close_and_no_error() {
+        use tokio::io::AsyncWriteExt;
+        let (_mux, mut stream, wire) = stream_with_wire().await;
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        assert!(matches!(sent_closes(&wire)[..], [CloseReason::Normal]));
+    }
+
+    #[tokio::test]
+    async fn drop_after_peer_closed_normally_is_not_an_error() {
+        use tokio::io::AsyncReadExt;
+        let (mux, mut stream, wire) = stream_with_wire().await;
+        mux.process_frame(Frame::CloseStream {
+            stream_id: 2,
+            reason: CloseReason::Normal,
+        })
+        .await
+        .unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            stream.read(&mut buf).await.unwrap(),
+            0,
+            "normal close is EOF"
+        );
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0, "and stays EOF");
+        drop(stream);
+        assert!(matches!(sent_closes(&wire)[..], [CloseReason::Normal]));
+    }
+
+    #[tokio::test]
+    async fn error_close_from_peer_is_a_read_error() {
+        use tokio::io::AsyncReadExt;
+        let (mux, mut stream, _wire) = stream_with_wire().await;
+        mux.process_frame(Frame::Data {
+            stream_id: 2,
+            data: Bytes::from_static(b"partial"),
+            end_of_stream: false,
+        })
+        .await
+        .unwrap();
+        mux.process_frame(Frame::CloseStream {
+            stream_id: 2,
+            reason: CloseReason::Error("stream dropped".into()),
+        })
+        .await
+        .unwrap();
+        let mut got = vec![];
+        let err = stream.read_to_end(&mut got).await.unwrap_err();
+        assert_eq!(got, b"partial", "data before the close is delivered intact");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test]
+    async fn channel_lost_without_close_is_a_read_error() {
+        use tokio::io::AsyncReadExt;
+        let (mux, mut stream, _wire) = stream_with_wire().await;
+        mux.streams.clear(); // the sender goes away with no CloseStream
+        let mut buf = [0u8; 8];
+        assert!(stream.read(&mut buf).await.is_err());
     }
 
     #[tokio::test]
