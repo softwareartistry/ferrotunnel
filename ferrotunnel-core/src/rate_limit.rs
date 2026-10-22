@@ -54,16 +54,20 @@ fn config_for_streams(per_sec: u32, base: &RateLimiterConfig) -> RateLimiterConf
     }
 }
 
-/// A `u32` env override, parsed once per process; invalid values are ignored.
+/// A `u32` env override, parsed once per process; an invalid value is ignored, with a warning.
 fn env_u32(cell: &'static std::sync::OnceLock<Option<u32>>, name: &str) -> Option<u32> {
     *cell.get_or_init(|| {
-        let v = std::env::var(name)
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok());
-        if let Some(v) = v {
-            tracing::info!("Session rate limit override {name}={v} (0 = unlimited)");
+        let raw = std::env::var(name).ok()?;
+        match raw.trim().parse::<u32>() {
+            Ok(v) => {
+                tracing::info!("Session rate limit override {name}={v} (0 = unlimited)");
+                Some(v)
+            }
+            Err(e) => {
+                tracing::warn!("Ignoring {name}={raw:?} ({e}); using the built-in default");
+                None
+            }
         }
-        v
     })
 }
 
