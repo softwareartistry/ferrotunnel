@@ -16,6 +16,11 @@ use tokio_util::codec::Framed;
 use tracing::{error, info};
 use uuid::Uuid;
 
+/// No frame from the server for this long means the connection is dead, even if
+/// TCP still looks open. The server acks every 30s heartbeat, so this is three
+/// missed acks, matching the server's own session timeout.
+const SERVER_SILENCE_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[cfg(feature = "quic")]
 use crate::stream::QuicVirtualStream;
 #[cfg(feature = "quic")]
@@ -490,12 +495,19 @@ impl TunnelClient {
         >,
     ) -> Result<()> {
         let mut heartbeat_interval = interval(Duration::from_secs(30));
+        let mut last_frame = tokio::time::Instant::now();
 
         loop {
             #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
             let decode_start = Instant::now();
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
+                    // A half-open connection never errors or closes, so without this
+                    // the agent would never reconnect.
+                    if last_frame.elapsed() >= SERVER_SILENCE_TIMEOUT {
+                        error!("No frames from server within {:?}; reconnecting", SERVER_SILENCE_TIMEOUT);
+                        return Err(TunnelError::Timeout("server silent past timeout".into()));
+                    }
                     let ts = clamp_u128_to_u64(
                         std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -508,6 +520,9 @@ impl TunnelClient {
                     }
                 }
                 result = split_stream.next() => {
+                    if matches!(result, Some(Ok(_))) {
+                        last_frame = tokio::time::Instant::now();
+                    }
                     match result {
                         Some(Ok(Frame::HeartbeatAck { .. })) => {
                             #[cfg(feature = "metrics")]
@@ -546,6 +561,53 @@ impl TunnelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Session loop over an in-memory connection whose server half is returned.
+    fn session_over_duplex() -> (
+        impl Future<Output = Result<()>>,
+        Framed<tokio::io::DuplexStream, TunnelCodec>,
+    ) {
+        let (agent_side, server_side) = tokio::io::duplex(64 * 1024);
+        let (frame_tx, frame_rx) = bounded_async::<PrioritizedFrame>(64);
+        tokio::spawn(async move { while frame_rx.recv().await.is_ok() {} });
+        let (multiplexer, _new_streams) = Multiplexer::new(frame_tx, true);
+        let stream: transport::BoxedStream = Box::pin(agent_side);
+        let (read_half, _write_half) = tokio::io::split(stream);
+        let mut framed = tokio_util::codec::FramedRead::new(read_half, TunnelCodec::new());
+        let run = async move { TunnelClient::run_session_loop(multiplexer, &mut framed).await };
+        (run, Framed::new(server_side, TunnelCodec::new()))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_loop_ends_when_server_goes_silent() {
+        let (run, _server) = session_over_duplex();
+        let err = tokio::time::timeout(SERVER_SILENCE_TIMEOUT * 2, run)
+            .await
+            .expect("a silent server must end the session")
+            .unwrap_err();
+        assert!(matches!(err, TunnelError::Timeout(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_loop_survives_while_server_acks() {
+        let (run, mut server) = session_over_duplex();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if server
+                    .send(Frame::HeartbeatAck { timestamp: 0 })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        // Ten silence timeouts of acked heartbeats: the loop must still be running.
+        assert!(tokio::time::timeout(SERVER_SILENCE_TIMEOUT * 10, run)
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     async fn handshake_read_times_out_for_silent_peer() {
