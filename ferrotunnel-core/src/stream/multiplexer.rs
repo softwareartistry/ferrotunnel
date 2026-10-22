@@ -427,6 +427,8 @@ pub struct VirtualStream {
     peer_closed: bool,
     /// We sent our normal close; dropping needs no further signal.
     close_sent: bool,
+    /// `pending_send` holds our close, not a data write.
+    closing: bool,
 }
 
 impl std::fmt::Debug for VirtualStream {
@@ -464,6 +466,7 @@ impl VirtualStream {
             protocol,
             peer_closed: false,
             close_sent: false,
+            closing: false,
         }
     }
 
@@ -483,14 +486,11 @@ impl Drop for VirtualStream {
             let buffer = std::mem::take(&mut self.read_buffer);
             pool.release(buffer);
         }
-        // Dropped without a close: tell the peer, or it waits on this stream forever.
-        // Normal only if the peer already ended it; otherwise this end is abnormal.
+        // Dropped without our close: tell the peer, or it waits on this stream forever.
+        // Always an error, even after the peer's close: that only ended *its* direction,
+        // and ours may have been cut short.
         if !self.close_sent {
-            let reason = if self.peer_closed {
-                ferrotunnel_protocol::frame::CloseReason::Normal
-            } else {
-                ferrotunnel_protocol::frame::CloseReason::Error("stream dropped".into())
-            };
+            let reason = ferrotunnel_protocol::frame::CloseReason::Error("stream dropped".into());
             let frame = (
                 self.priority,
                 Frame::CloseStream {
@@ -669,12 +669,20 @@ impl AsyncWrite for VirtualStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.close_sent {
+            return Poll::Ready(Ok(()));
+        }
         // If we have a pending send, poll it first
         if let Some(fut) = self.pending_send.as_mut() {
             match fut.as_mut().poll(cx) {
-                Poll::Ready(_) => {
+                Poll::Ready(result) => {
                     self.pending_send = None;
                     self.pending_send_len = 0;
+                    // A close that had to wait is now sent: don't send another.
+                    if self.closing {
+                        self.close_sent = result.is_ok();
+                        return Poll::Ready(result);
+                    }
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -689,6 +697,7 @@ impl AsyncWrite for VirtualStream {
 
         let tx = self.tx.clone();
         self.pending_send = Some(bounded_send_future(tx, (priority, frame)));
+        self.closing = true;
 
         let fut = match self.pending_send.as_mut() {
             Some(f) => f,
@@ -888,6 +897,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_that_waits_sends_exactly_one_close() {
+        use tokio::io::AsyncWriteExt;
+        let (mux, mut stream, wire) = stream_with_wire().await;
+        // Fill the wire so the close has to wait.
+        while let Ok(true) = mux
+            .frame_tx
+            .try_send((StreamPriority::default(), Frame::Heartbeat { timestamp: 0 }))
+        {}
+        let mut shutdown = Box::pin(stream.shutdown());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        while let Ok(Some(_)) = wire.try_recv() {}
+        shutdown.await.unwrap();
+        drop(stream);
+        assert!(matches!(sent_closes(&wire)[..], [CloseReason::Normal]));
+    }
+
+    #[tokio::test]
     async fn dropped_stream_tells_the_peer_with_an_error() {
         let (_mux, stream, wire) = stream_with_wire().await;
         drop(stream);
@@ -904,7 +930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_after_peer_closed_normally_is_not_an_error() {
+    async fn drop_after_peer_closed_without_our_close_is_an_error() {
         use tokio::io::AsyncReadExt;
         let (mux, mut stream, wire) = stream_with_wire().await;
         mux.process_frame(Frame::CloseStream {
@@ -920,8 +946,9 @@ mod tests {
             "normal close is EOF"
         );
         assert_eq!(stream.read(&mut buf).await.unwrap(), 0, "and stays EOF");
+        // The peer only finished its direction; ours never closed, so it may be cut short.
         drop(stream);
-        assert!(matches!(sent_closes(&wire)[..], [CloseReason::Normal]));
+        assert!(matches!(sent_closes(&wire)[..], [CloseReason::Error(_)]));
     }
 
     #[tokio::test]

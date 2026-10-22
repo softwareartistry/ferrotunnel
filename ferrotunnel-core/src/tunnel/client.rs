@@ -542,6 +542,9 @@ impl TunnelClient {
                             if let Err(e) = multiplexer.process_frame(frame).await {
                                 error!("Multiplexer error: {}", e);
                             }
+                            // A long delivery is a busy loop, not a silent server: the
+                            // frames that arrived meanwhile are still unread.
+                            last_frame = tokio::time::Instant::now();
                         }
                         Some(Err(e)) => {
                             error!("Protocol error: {}", e);
@@ -586,6 +589,73 @@ mod tests {
             .expect("a silent server must end the session")
             .unwrap_err();
         assert!(matches!(err, TunnelError::Timeout(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_delivery_is_not_a_silent_server() {
+        use ferrotunnel_protocol::frame::{OpenStreamFrame, Protocol, StreamPriority};
+        use tokio::io::AsyncReadExt;
+        // The race this guards is a coin flip per run, so run it repeatedly.
+        for _ in 0..10 {
+            let (agent_side, server_side) = tokio::io::duplex(16 << 20);
+            let (frame_tx, frame_rx) = bounded_async::<PrioritizedFrame>(64);
+            tokio::spawn(async move { while frame_rx.recv().await.is_ok() {} });
+            let (multiplexer, new_streams) = Multiplexer::new(frame_tx, true);
+            let stream: transport::BoxedStream = Box::pin(agent_side);
+            let (read_half, _write_half) = tokio::io::split(stream);
+            let mut framed = tokio_util::codec::FramedRead::new(read_half, TunnelCodec::new());
+            let run = tokio::spawn(async move {
+                TunnelClient::run_session_loop(multiplexer, &mut framed).await
+            });
+
+            let mut server = Framed::new(server_side, TunnelCodec::new());
+            server
+                .send(Frame::OpenStream(Box::new(OpenStreamFrame {
+                    stream_id: 2,
+                    protocol: Protocol::GRPC,
+                    headers: vec![],
+                    body_hint: None,
+                    priority: StreamPriority::default(),
+                })))
+                .await
+                .unwrap();
+            // More data than the stream's channel holds, so delivery blocks the loop.
+            for _ in 0..200 {
+                server
+                    .send(Frame::Data {
+                        stream_id: 2,
+                        data: bytes::Bytes::from_static(b"0123456789"),
+                        end_of_stream: false,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut local = new_streams.recv().await.unwrap();
+            // The server stays alive: an ack every 30s, queued behind the blocked delivery.
+            let acks = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    if server
+                        .send(Frame::HeartbeatAck { timestamp: 0 })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            // Hold the loop busy past the silence timeout, then drain.
+            tokio::time::sleep(SERVER_SILENCE_TIMEOUT + Duration::from_secs(10)).await;
+            let mut buf = vec![0u8; 2000];
+            local.read_exact(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            assert!(
+                !run.is_finished(),
+                "a busy loop must not read as a silent server"
+            );
+            run.abort();
+            acks.abort();
+        }
     }
 
     #[tokio::test(start_paused = true)]
