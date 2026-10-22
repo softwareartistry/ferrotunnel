@@ -15,11 +15,14 @@ use kanal::bounded_async;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-#[cfg(feature = "quic")]
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// A session with no frame from its agent for this long is gone. Agents heartbeat
+/// every 30s, so this is three missed heartbeats.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[cfg(feature = "quic")]
 use crate::stream::QuicMultiplexer;
@@ -64,7 +67,7 @@ impl TunnelServer {
             addr,
             auth_token,
             sessions: SessionStoreBackend::default(),
-            session_timeout: Duration::from_secs(90),
+            session_timeout: SESSION_TIMEOUT,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             resource_limits: ServerResourceLimits::default(),
             transport_config: TransportConfig::default(),
@@ -382,7 +385,14 @@ impl TunnelServer {
         loop {
             #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
             let decode_start = Instant::now();
-            let result = stream.next().await;
+            // Bounded: a half-open connection never yields EOF or an error, and the
+            // caller can only fail this session's streams once the loop ends.
+            let Ok(result) = timeout(SESSION_TIMEOUT, stream.next()).await else {
+                warn!(session_id = %session_id, "No frames from agent within {:?}; ending session", SESSION_TIMEOUT);
+                return Err(TunnelError::Timeout(
+                    "agent silent past session timeout".into(),
+                ));
+            };
             let Some(frame_result) = result else { break };
             let frame = frame_result?;
 
@@ -925,6 +935,38 @@ mod tests {
             abort.is_finished(),
             "cleanup task should be aborted after server drop"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn process_messages_ends_on_silent_agent() {
+        // Half-open: the agent side stays open but never sends a frame.
+        let (_client_side, server_side) = tokio::io::duplex(1024);
+        let (frame_tx, _frame_rx) = bounded_async::<PrioritizedFrame>(16);
+        let (multiplexer, _new_stream_rx) = Multiplexer::new(frame_tx, false);
+        let session_id = Uuid::new_v4();
+        let sessions = SessionStoreBackend::default();
+        sessions
+            .add(Session::new(
+                session_id,
+                "silent".into(),
+                "127.0.0.1:0".parse().unwrap(),
+                "tok".into(),
+                vec![],
+                Some(AnyMultiplexer::Tcp(multiplexer.clone())),
+            ))
+            .unwrap();
+
+        let server_stream: BoxedStream = Box::pin(server_side);
+        let (read_half, _write_half) = tokio::io::split(server_stream);
+        let framed_read = tokio_util::codec::FramedRead::new(read_half, TunnelCodec::new());
+        let err = timeout(
+            SESSION_TIMEOUT * 2,
+            TunnelServer::process_messages(framed_read, session_id, sessions, multiplexer),
+        )
+        .await
+        .expect("loop must end on a silent agent")
+        .unwrap_err();
+        assert!(matches!(err, TunnelError::Timeout(_)));
     }
 
     #[tokio::test]
