@@ -43,6 +43,30 @@ const MAX_THROTTLE_CHUNK_SECS: u32 = 30;
 /// Env var overriding the per-session data budget in MB/s; `0` disables session rate limiting.
 pub const RATE_LIMIT_MBPS_ENV: &str = "FERROTUNNEL_RATE_LIMIT_MBPS";
 
+/// Env var overriding the per-session stream-open rate; `0` lifts the stream-open limit.
+pub const STREAMS_PER_SEC_ENV: &str = "FERROTUNNEL_STREAMS_PER_SEC";
+
+/// `base` with an explicit stream-open rate (`0` = unlimited -> `u32::MAX`).
+fn config_for_streams(per_sec: u32, base: &RateLimiterConfig) -> RateLimiterConfig {
+    RateLimiterConfig {
+        streams_per_sec: NonZeroU32::new(per_sec).unwrap_or(NonZeroU32::MAX),
+        ..base.clone()
+    }
+}
+
+/// A `u32` env override, parsed once per process; invalid values are ignored.
+fn env_u32(cell: &'static std::sync::OnceLock<Option<u32>>, name: &str) -> Option<u32> {
+    *cell.get_or_init(|| {
+        let v = std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        if let Some(v) = v {
+            tracing::info!("Session rate limit override {name}={v} (0 = unlimited)");
+        }
+        v
+    })
+}
+
 /// `base` with an explicit MB/s budget (`0` = unlimited -> `None`), saturating at `u32::MAX` bytes/s.
 fn config_for_mbps(mbps: u32, base: &RateLimiterConfig) -> Option<RateLimiterConfig> {
     match mbps {
@@ -67,24 +91,19 @@ pub struct SessionRateLimiter {
 }
 
 impl SessionRateLimiter {
-    /// Limiter for a new session: `config`, with its byte budget overridden by
-    /// [`RATE_LIMIT_MBPS_ENV`] when set (parsed once; invalid is ignored, `0` -> `None` = unlimited).
+    /// Limiter for a new session: `config`, with its stream-open rate overridden by
+    /// [`STREAMS_PER_SEC_ENV`] and its byte budget by [`RATE_LIMIT_MBPS_ENV`] when set.
+    /// A `0` byte budget means no limiter at all (`None`).
     pub fn for_session(config: &RateLimiterConfig) -> Option<Self> {
+        static ENV_STREAMS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
         static ENV_MBPS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-        let mbps = *ENV_MBPS.get_or_init(|| {
-            let mbps = std::env::var(RATE_LIMIT_MBPS_ENV)
-                .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok());
-            if let Some(mbps) = mbps {
-                tracing::info!(
-                    "Session rate limit set from {RATE_LIMIT_MBPS_ENV}: {mbps} MB/s (0 = unlimited)"
-                );
-            }
-            mbps
-        });
-        match mbps {
-            Some(mbps) => config_for_mbps(mbps, config).map(|cfg| Self::new(&cfg)),
-            None => Some(Self::new(config)),
+        let config = match env_u32(&ENV_STREAMS, STREAMS_PER_SEC_ENV) {
+            Some(per_sec) => config_for_streams(per_sec, config),
+            None => config.clone(),
+        };
+        match env_u32(&ENV_MBPS, RATE_LIMIT_MBPS_ENV) {
+            Some(mbps) => config_for_mbps(mbps, &config).map(|cfg| Self::new(&cfg)),
+            None => Some(Self::new(&config)),
         }
     }
 
@@ -240,6 +259,25 @@ mod tests {
     fn config_for_mbps_saturates_instead_of_overflowing() {
         let cfg = config_for_mbps(u32::MAX, &RateLimiterConfig::default()).unwrap();
         assert_eq!(cfg.bytes_per_sec.get(), u32::MAX);
+    }
+
+    #[test]
+    fn config_for_streams_overrides_only_the_stream_rate() {
+        let base = RateLimiterConfig::default();
+        let cfg = config_for_streams(2000, &base);
+        assert_eq!(cfg.streams_per_sec.get(), 2000);
+        assert_eq!(cfg.bytes_per_sec, base.bytes_per_sec);
+        assert_eq!(cfg.burst_factor, base.burst_factor);
+    }
+
+    #[test]
+    fn config_for_streams_zero_lifts_the_stream_limit() {
+        let limiter =
+            SessionRateLimiter::new(&config_for_streams(0, &RateLimiterConfig::default()));
+        // Far past the 100/s default (burst 200): an unlimited stream rate never refuses.
+        for _ in 0..10_000 {
+            assert!(limiter.check_stream_open().is_ok());
+        }
     }
 
     #[test]
