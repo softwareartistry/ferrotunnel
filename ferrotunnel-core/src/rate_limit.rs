@@ -40,6 +40,21 @@ fn scaled_burst(rate: NonZeroU32, burst_factor: NonZeroU32) -> NonZeroU32 {
 /// Upper bound, in seconds of quota, on a single throttle wait.
 const MAX_THROTTLE_CHUNK_SECS: u32 = 30;
 
+/// Env var overriding the per-session data budget in MB/s; `0` disables session rate limiting.
+pub const RATE_LIMIT_MBPS_ENV: &str = "FERROTUNNEL_RATE_LIMIT_MBPS";
+
+/// `base` with an explicit MB/s budget (`0` = unlimited -> `None`), saturating at `u32::MAX` bytes/s.
+fn config_for_mbps(mbps: u32, base: &RateLimiterConfig) -> Option<RateLimiterConfig> {
+    match mbps {
+        0 => None,
+        mbps => Some(RateLimiterConfig {
+            bytes_per_sec: NonZeroU32::new(mbps.saturating_mul(1024 * 1024))
+                .unwrap_or(NonZeroU32::MAX),
+            ..base.clone()
+        }),
+    }
+}
+
 /// Rate limiter for a single session
 #[derive(Clone)]
 pub struct SessionRateLimiter {
@@ -52,6 +67,27 @@ pub struct SessionRateLimiter {
 }
 
 impl SessionRateLimiter {
+    /// Limiter for a new session: `config`, with its byte budget overridden by
+    /// [`RATE_LIMIT_MBPS_ENV`] when set (parsed once; invalid is ignored, `0` -> `None` = unlimited).
+    pub fn for_session(config: &RateLimiterConfig) -> Option<Self> {
+        static ENV_MBPS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let mbps = *ENV_MBPS.get_or_init(|| {
+            let mbps = std::env::var(RATE_LIMIT_MBPS_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok());
+            if let Some(mbps) = mbps {
+                tracing::info!(
+                    "Session rate limit set from {RATE_LIMIT_MBPS_ENV}: {mbps} MB/s (0 = unlimited)"
+                );
+            }
+            mbps
+        });
+        match mbps {
+            Some(mbps) => config_for_mbps(mbps, config).map(|cfg| Self::new(&cfg)),
+            None => Some(Self::new(config)),
+        }
+    }
+
     /// Create a new session rate limiter
     #[must_use]
     pub fn new(config: &RateLimiterConfig) -> Self {
@@ -182,6 +218,29 @@ impl From<ferrotunnel_common::config::RateLimitConfig> for RateLimiterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_for_mbps_zero_disables_limiting() {
+        assert!(config_for_mbps(0, &RateLimiterConfig::default()).is_none());
+    }
+
+    #[test]
+    fn config_for_mbps_overrides_only_the_byte_budget() {
+        let base = RateLimiterConfig {
+            streams_per_sec: NonZeroU32::new(7).unwrap(),
+            ..RateLimiterConfig::default()
+        };
+        let cfg = config_for_mbps(200, &base).expect("200 MB/s must yield a config");
+        assert_eq!(cfg.bytes_per_sec.get(), 200 * 1024 * 1024);
+        assert_eq!(cfg.streams_per_sec, base.streams_per_sec);
+        assert_eq!(cfg.burst_factor, base.burst_factor);
+    }
+
+    #[test]
+    fn config_for_mbps_saturates_instead_of_overflowing() {
+        let cfg = config_for_mbps(u32::MAX, &RateLimiterConfig::default()).unwrap();
+        assert_eq!(cfg.bytes_per_sec.get(), u32::MAX);
+    }
 
     #[test]
     fn test_rate_limiter_creation() {

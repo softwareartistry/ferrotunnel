@@ -349,18 +349,21 @@ impl TunnelServer {
                 // stream opens are metered too: `process_messages` only sees
                 // `OpenStream` frames sent by the client, never the ones the
                 // ingress opens on its behalf.
-                let rate_limiter = SessionRateLimiter::new(&rate_limits.into());
-                let session = Session::new(
+                // FERROTUNNEL_RATE_LIMIT_MBPS overrides the byte budget; 0 = unlimited.
+                let rate_limiter = SessionRateLimiter::for_session(&rate_limits.into());
+                let session_mux = match &rate_limiter {
+                    Some(limiter) => multiplexer.clone().with_rate_limiter(limiter.clone()),
+                    None => multiplexer.clone(),
+                };
+                let mut session = Session::new(
                     session_id,
                     tunnel_id.clone(),
                     addr,
                     token,
                     capabilities,
-                    Some(AnyMultiplexer::Tcp(
-                        multiplexer.clone().with_rate_limiter(rate_limiter.clone()),
-                    )),
-                )
-                .with_rate_limiter(rate_limiter);
+                    Some(AnyMultiplexer::Tcp(session_mux)),
+                );
+                session.rate_limiter = rate_limiter;
 
                 if let Err(e) = sessions.add(session) {
                     warn!("Failed to register session: {}", e);
