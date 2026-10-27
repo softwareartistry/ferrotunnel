@@ -1,6 +1,7 @@
 pub mod bytes_pool;
 pub mod multiplexer;
 pub mod pool;
+pub mod probe;
 #[cfg(feature = "quic")]
 pub mod quic_multiplexer;
 #[cfg(feature = "quic")]
@@ -62,6 +63,22 @@ impl AnyMultiplexer {
                     None => Ok(Box::pin(stream)),
                 }
             }
+        }
+    }
+
+    /// Probe the client link (heartbeat round trip, then a burst); QUIC sessions are not supported.
+    pub async fn probe(
+        &self,
+        bytes: u64,
+        streams: u32,
+        wait: std::time::Duration,
+    ) -> Result<probe::ProbeResult> {
+        match self {
+            Self::Tcp(m) => m.probe(bytes, streams, wait).await,
+            #[cfg(feature = "quic")]
+            Self::Quic(_) => Err(ferrotunnel_common::TunnelError::Protocol(
+                "probe is not supported on QUIC sessions".into(),
+            )),
         }
     }
 

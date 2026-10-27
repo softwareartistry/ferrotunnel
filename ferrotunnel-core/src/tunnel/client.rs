@@ -419,7 +419,11 @@ impl TunnelClient {
                 max_version: MAX_PROTOCOL_VERSION,
                 token: client.auth_token.clone(),
                 tunnel_id: client.tunnel_id.clone(),
-                capabilities: vec!["basic".to_string(), "tcp".to_string()],
+                capabilities: vec![
+                    "basic".to_string(),
+                    "tcp".to_string(),
+                    crate::stream::probe::PROBE_CAPABILITY.to_string(),
+                ],
             })))
             .await?;
 

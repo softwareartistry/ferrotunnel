@@ -1,5 +1,7 @@
 use crate::accept_errors::{is_transient_accept_error, AcceptBackoff};
 use ferrotunnel_common::Result;
+use ferrotunnel_core::stream::probe::{mbps, PROBE_CAPABILITY};
+use ferrotunnel_core::stream::AnyMultiplexer;
 use ferrotunnel_core::tunnel::session::SessionStoreBackend;
 use ferrotunnel_plugin::{PluginAction, PluginRegistry, RequestContext, ResponseContext};
 use ferrotunnel_protocol::frame::Protocol;
@@ -257,9 +259,11 @@ async fn handle_request(
     // However, for verify plan "Routing Fix", strict lookup is key.
 
     // We need to clone multiplexer from the Ref
-    let multiplexer = if let Some(session) = sessions.get_by_tunnel_id(&tunnel_id) {
+    let (multiplexer, supports_probe) = if let Some(session) = sessions.get_by_tunnel_id(&tunnel_id)
+    {
         if let Some(m) = &session.multiplexer {
-            m.clone()
+            let supports_probe = session.capabilities.iter().any(|c| c == PROBE_CAPABILITY);
+            (m.clone(), supports_probe)
         } else {
             return Ok(full_response(StatusCode::BAD_GATEWAY, "Tunnel not ready"));
         }
@@ -270,6 +274,11 @@ async fn handle_request(
         // Let's assume strict for now as per issue description "Insecure Global Routing".
         return Ok(full_response(StatusCode::NOT_FOUND, "Tunnel not found"));
     };
+
+    // Answered by the server itself after plugin auth, never forwarded to the client's service.
+    if parts.uri.path() == PROBE_PATH {
+        return Ok(handle_probe(&multiplexer, supports_probe, parts.uri.query(), &config).await);
+    }
 
     // Reconstruct request for forwarding using the ORIGINAL streaming body
     // FIX #28: No body buffering here.
@@ -1015,6 +1024,86 @@ fn full_response(status: StatusCode, body: &str) -> Response<BoxBody> {
                     .boxed(),
             )
         })
+}
+
+/// Ingress path that runs a link probe against the tunnel named by the Host header.
+pub const PROBE_PATH: &str = "/tunnel-probe";
+
+const DEFAULT_PROBE_BYTES: u64 = 50 * 1024 * 1024;
+const PROBE_PING_WAIT: Duration = Duration::from_secs(5);
+
+// Reads `name=<u64>` from a query string; missing or malformed falls back to `default`.
+fn query_u64(query: Option<&str>, name: &str, default: u64) -> u64 {
+    query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == name)
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn json_response(status: StatusCode, body: String) -> Response<BoxBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(full_body(Bytes::from(body)))
+        .unwrap_or_else(|_| full_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))
+}
+
+fn json_error(status: StatusCode, message: &str) -> Response<BoxBody> {
+    json_response(status, format!("{{\"error\":{message:?}}}"))
+}
+
+async fn handle_probe(
+    multiplexer: &AnyMultiplexer,
+    supports_probe: bool,
+    query: Option<&str>,
+    config: &IngressConfig,
+) -> Response<BoxBody> {
+    if !supports_probe {
+        return json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "tunnel client does not support probes",
+        );
+    }
+    let bytes = query_u64(query, "bytes", DEFAULT_PROBE_BYTES);
+    let streams = u32::try_from(query_u64(query, "streams", 1)).unwrap_or(u32::MAX);
+    let run = multiplexer.probe(bytes, streams, PROBE_PING_WAIT);
+    let result = match tokio::time::timeout(config.response_timeout, run).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => return json_error(StatusCode::BAD_GATEWAY, &e.to_string()),
+        Err(_) => return json_error(StatusCode::GATEWAY_TIMEOUT, "probe timed out"),
+    };
+    let burst = &result.burst;
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let per_stream: Vec<String> = burst
+        .streams
+        .iter()
+        .map(|s| {
+            format!(
+                "{{\"bytes\":{},\"elapsed_ms\":{:.1},\"mbps\":{:.2}}}",
+                s.bytes,
+                ms(s.elapsed),
+                mbps(s.bytes, s.elapsed)
+            )
+        })
+        .collect();
+    let steady = burst
+        .steady
+        .map_or_else(|| "null".to_string(), |(b, d)| format!("{:.2}", mbps(b, d)));
+    json_response(
+        StatusCode::OK,
+        format!(
+            "{{\"rtt_ms\":{:.2},\"bytes\":{},\"elapsed_ms\":{:.1},\"mbps\":{:.2},\"mbps_after_warmup\":{},\"streams\":[{}]}}",
+            ms(result.rtt),
+            burst.bytes,
+            ms(burst.elapsed),
+            mbps(burst.bytes, burst.elapsed),
+            steady,
+            per_stream.join(",")
+        ),
+    )
 }
 
 fn full_body(bytes: Bytes) -> BoxBody {
