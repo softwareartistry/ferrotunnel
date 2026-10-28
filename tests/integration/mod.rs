@@ -11,6 +11,7 @@ mod grpc_test;
 mod http3_test;
 mod multi_client_test;
 mod plugin_test;
+mod probe_test;
 #[cfg(feature = "quic")]
 mod quic_test;
 mod tcp_test;

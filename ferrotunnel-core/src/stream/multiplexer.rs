@@ -15,7 +15,7 @@ use ferrotunnel_protocol::frame::{Frame, OpenStreamFrame, Protocol, StreamPriori
 use kanal::{bounded_async, AsyncReceiver, AsyncSender, ReceiveError};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -71,6 +71,11 @@ pub struct Multiplexer {
     new_stream_tx: AsyncSender<VirtualStream>,
     buffer_pool: ReadBufferPool,
     rate_limiter: Option<crate::rate_limit::SessionRateLimiter>,
+    /// Client side of the session: answers probe heartbeats and probe bursts.
+    is_client: bool,
+    /// Outstanding [`Multiplexer::ping`] calls, keyed by the nonce they sent.
+    pending_pings: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    next_ping: Arc<AtomicU64>,
 }
 
 /// Send a prioritized frame to the wire channel with a bounded deadline.
@@ -123,6 +128,9 @@ impl Multiplexer {
                 new_stream_tx,
                 buffer_pool: ReadBufferPool::with_default_capacity(),
                 rate_limiter: None,
+                is_client,
+                pending_pings: Arc::new(DashMap::new()),
+                next_ping: Arc::new(AtomicU64::new(1)),
             },
             new_stream_rx,
         )
@@ -153,7 +161,9 @@ impl Multiplexer {
             Frame::Data { stream_id, .. } => priorities
                 .get(stream_id)
                 .map_or(StreamPriority::Normal, |r| *r),
-            Frame::Heartbeat { .. } | Frame::HandshakeAck { .. } => StreamPriority::Critical,
+            Frame::Heartbeat { .. } | Frame::HeartbeatAck { .. } | Frame::HandshakeAck { .. } => {
+                StreamPriority::Critical
+            }
             Frame::CloseStream { stream_id, .. } => priorities
                 .get(stream_id)
                 .map_or(StreamPriority::Normal, |r| *r),
@@ -193,6 +203,18 @@ impl Multiplexer {
     /// Still uses async send to ensure reliable delivery (dropping data breaks protocols).
     pub async fn process_frame(&self, frame: Frame) -> Result<()> {
         match &frame {
+            // A heartbeat that reaches the client's multiplexer came from the server: echo its nonce.
+            Frame::Heartbeat { timestamp } if self.is_client => {
+                self.send_frame(Frame::HeartbeatAck {
+                    timestamp: *timestamp,
+                })
+                .await?;
+            }
+            Frame::HeartbeatAck { timestamp } => {
+                if let Some((_, waiter)) = self.pending_pings.remove(timestamp) {
+                    let _ = waiter.send(());
+                }
+            }
             Frame::OpenStream(open_stream) => {
                 let stream_id = open_stream.stream_id;
                 let priority = open_stream.priority;
@@ -220,6 +242,14 @@ impl Multiplexer {
                     self.buffer_pool.clone(),
                     open_stream.protocol,
                 );
+
+                // A probe burst is answered by the tunnel itself, never by the local service.
+                if self.is_client {
+                    if let Some(bytes) = super::probe::burst_request(&open_stream.headers) {
+                        tokio::spawn(super::probe::serve_burst(stream, bytes));
+                        return Ok(());
+                    }
+                }
 
                 // OpenStream is a control path - use async send for reliability
                 if self.new_stream_tx.send(stream).await.is_err() {
@@ -307,6 +337,17 @@ impl Multiplexer {
         protocol: Protocol,
         priority: StreamPriority,
     ) -> Result<VirtualStream> {
+        self.open_stream_with_headers(protocol, priority, vec![])
+            .await
+    }
+
+    /// Open a new outbound stream that carries `headers` in its `OpenStream` frame.
+    pub async fn open_stream_with_headers(
+        &self,
+        protocol: Protocol,
+        priority: StreamPriority,
+        headers: Vec<(String, String)>,
+    ) -> Result<VirtualStream> {
         let stream_id = self.allocate_stream_id()?;
 
         let (tx, rx) = bounded_async(STREAM_CHANNEL_CAPACITY);
@@ -326,7 +367,7 @@ impl Multiplexer {
                 Frame::OpenStream(Box::new(OpenStreamFrame {
                     stream_id,
                     protocol,
-                    headers: vec![],
+                    headers,
                     body_hint: None,
                     priority,
                 })),
@@ -344,6 +385,25 @@ impl Multiplexer {
             self.buffer_pool.clone(),
             protocol,
         ))
+    }
+
+    /// One round trip to the peer via a nonce heartbeat; a peer without the `probe` capability never echoes, so this times out.
+    pub async fn ping(&self, wait: Duration) -> Result<Duration> {
+        let nonce = self.next_ping.fetch_add(1, Ordering::Relaxed);
+        let (waiter, echoed) = tokio::sync::oneshot::channel();
+        self.pending_pings.insert(nonce, waiter);
+        let started = tokio::time::Instant::now();
+        if let Err(e) = self.send_frame(Frame::Heartbeat { timestamp: nonce }).await {
+            self.pending_pings.remove(&nonce);
+            return Err(e);
+        }
+        let outcome = tokio::time::timeout(wait, echoed).await;
+        self.pending_pings.remove(&nonce);
+        match outcome {
+            Ok(Ok(())) => Ok(started.elapsed()),
+            Ok(Err(_)) => Err(TunnelError::Protocol("tunnel session closed".into())),
+            Err(_) => Err(TunnelError::Timeout("no heartbeat echo from peer".into())),
+        }
     }
 }
 
@@ -1011,5 +1071,54 @@ mod tests {
         assert!(read.is_err(), "a cut stream must error, not look complete");
 
         assert!(held.open_stream(Protocol::GRPC).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn client_echoes_server_heartbeat_nonce() {
+        let (tx, rx) = bounded_async::<PrioritizedFrame>(8);
+        let (client, _streams) = Multiplexer::new(tx, true);
+
+        client
+            .process_frame(Frame::Heartbeat { timestamp: 42 })
+            .await
+            .unwrap();
+
+        let (_, frame) = rx.recv().await.unwrap();
+        assert_eq!(frame, Frame::HeartbeatAck { timestamp: 42 });
+    }
+
+    #[tokio::test]
+    async fn server_does_not_echo_heartbeats() {
+        let (tx, rx) = bounded_async::<PrioritizedFrame>(8);
+        let (server, _streams) = Multiplexer::new(tx, false);
+
+        server
+            .process_frame(Frame::Heartbeat { timestamp: 42 })
+            .await
+            .unwrap();
+
+        assert!(rx.try_recv().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ping_completes_on_matching_ack_and_times_out_without_one() {
+        let (tx, rx) = bounded_async::<PrioritizedFrame>(8);
+        let (server, _streams) = Multiplexer::new(tx, false);
+
+        let echo = server.clone();
+        let responder = tokio::spawn(async move {
+            let (_, frame) = rx.recv().await.unwrap();
+            let Frame::Heartbeat { timestamp } = frame else {
+                panic!("expected a heartbeat, got {frame:?}")
+            };
+            echo.process_frame(Frame::HeartbeatAck { timestamp })
+                .await
+                .unwrap();
+            rx
+        });
+        assert!(server.ping(Duration::from_secs(5)).await.is_ok());
+
+        let _rx = responder.await.unwrap();
+        assert!(server.ping(Duration::from_millis(50)).await.is_err());
     }
 }
