@@ -15,10 +15,13 @@ const DEFAULT_BUFFER_BYTES: usize = 1024 * 1024;
 const KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Env var overriding the send and receive buffer size of every tunnel TCP
-/// connection, in bytes; `0` leaves both to the OS. A fixed size turns off the
-/// OS's buffer auto-tuning, and one TCP connection carries every stream of a
-/// session, so it caps the session at about size / round-trip time.
+/// Env var overriding the send and receive buffer size, in bytes, of every
+/// socket this crate tunes: the tunnel connection on both sides, and the
+/// agent's HTTP pool connections to its local target. `0` leaves both to the
+/// OS. A fixed size turns off the OS's buffer auto-tuning, and one TCP
+/// connection carries every stream of a session, so it caps the session at
+/// about size / round-trip time. Values above `i32::MAX` are clamped (the
+/// socket option is a C int).
 pub const SOCKET_BUFFER_BYTES_ENV: &str = "FERROTUNNEL_SOCKET_BUFFER_BYTES";
 
 static BUFFER_BYTES: OnceLock<usize> = OnceLock::new();
@@ -32,7 +35,7 @@ pub fn set_buffer_bytes(bytes: usize) -> bool {
 }
 
 fn buffer_bytes() -> usize {
-    *BUFFER_BYTES.get_or_init(|| {
+    let bytes = *BUFFER_BYTES.get_or_init(|| {
         let Ok(raw) = std::env::var(SOCKET_BUFFER_BYTES_ENV) else {
             return DEFAULT_BUFFER_BYTES;
         };
@@ -48,7 +51,9 @@ fn buffer_bytes() -> usize {
                 DEFAULT_BUFFER_BYTES
             }
         }
-    })
+    });
+    // A larger value would wrap in the C int, e.g. 4 GiB to 0.
+    bytes.min(i32::MAX as usize)
 }
 
 pub fn configure_socket(stream: &TcpStream) -> io::Result<()> {
@@ -56,10 +61,15 @@ pub fn configure_socket(stream: &TcpStream) -> io::Result<()> {
 
     let socket = SockRef::from(stream);
 
+    // Best-effort, so a refused size never skips the keepalive below.
     let bytes = buffer_bytes();
     if bytes > 0 {
-        socket.set_recv_buffer_size(bytes)?;
-        socket.set_send_buffer_size(bytes)?;
+        if let Err(e) = socket.set_recv_buffer_size(bytes) {
+            tracing::debug!("SO_RCVBUF {bytes} refused: {e}");
+        }
+        if let Err(e) = socket.set_send_buffer_size(bytes) {
+            tracing::debug!("SO_SNDBUF {bytes} refused: {e}");
+        }
     }
 
     let keepalive = socket2::TcpKeepalive::new()
